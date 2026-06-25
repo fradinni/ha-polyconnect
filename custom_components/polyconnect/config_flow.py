@@ -11,33 +11,66 @@ from homeassistant.helpers.selector import (
 
 from .const import DOMAIN, CONF_BRIDGE_URL, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, LOGGER
 
-ADDON_SLUG = "polyconnect_bridge"
+ADDON_SLUG_SUFFIX = "polyconnect_bridge"
 ADDON_DEFAULT_URL = "http://homeassistant.local:8765"
 
 
 async def _detect_addon_url(hass: HomeAssistant) -> str | None:
-    """Return the add-on ingress URL if the bridge add-on is installed and running."""
+    """Return the bridge add-on URL if it is installed and running.
+
+    Uses the Supervisor REST API (only available on HA OS / Supervised).
+    Returns the direct container IP URL (more reliable than ingress, which
+    requires additional auth headers and an open ingress session).
+
+    The add-on slug has a repository-hash prefix (e.g. ``ecbbef75_polyconnect_bridge``)
+    that varies per installation, so we list all add-ons first and find the one whose
+    slug ends with ``_polyconnect_bridge`` rather than hard-coding the full slug.
+    """
     try:
-        # Ask the supervisor for the add-on info
+        import os
         import aiohttp
-        supervisor_token = hass.data.get("hassio", {}).get("config", {}).get("supervisor") or ""
+        # SUPERVISOR_TOKEN is injected by the Supervisor into the HA Core container env
+        supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
+        if not supervisor_token:
+            return None
+        headers = {"Authorization": f"Bearer {supervisor_token}"}
+        timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession() as s:
+            # Step 1: list installed add-ons to resolve the hash-prefixed slug
             async with s.get(
-                f"http://supervisor/addons/{ADDON_SLUG}/info",
-                headers={"Authorization": f"Bearer {supervisor_token}"},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as r:
-                if r.status == 200:
-                    info = await r.json()
+                "http://supervisor/addons",
+                headers=headers,
+                timeout=timeout,
+            ) as list_r:
+                if list_r.status != 200:
+                    return None
+                list_data = await list_r.json()
+                addons = list_data.get("data", {}).get("addons", [])
+                slug = next(
+                    (a["slug"] for a in addons if a.get("slug", "").endswith(ADDON_SLUG_SUFFIX)),
+                    None,
+                )
+                if not slug:
+                    LOGGER.debug("Polyconnect Bridge add-on not found in installed add-ons")
+                    return None
+
+            # Step 2: fetch the add-on details to get its container IP
+            async with s.get(
+                f"http://supervisor/addons/{slug}/info",
+                headers=headers,
+                timeout=timeout,
+            ) as info_r:
+                if info_r.status == 200:
+                    info = await info_r.json()
                     data = info.get("data", {})
                     if data.get("state") == "started":
-                        # Use ingress URL if available, otherwise the exposed port
-                        ingress = data.get("ingress_url", "")
-                        if ingress:
-                            LOGGER.debug("Auto-detected add-on ingress URL: %s", ingress)
-                            return f"http://supervisor{ingress}"
+                        ip = data.get("ip_address", "")
+                        if ip:
+                            url = f"http://{ip}:8765"
+                            LOGGER.debug("Auto-detected add-on URL: %s (slug=%s)", url, slug)
+                            return url
     except Exception as e:
-        LOGGER.debug("Could not detect add-on: %s", e)
+        LOGGER.debug("Could not detect add-on URL: %s", e)
     return None
 
 
