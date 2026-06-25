@@ -2,7 +2,7 @@ name: "Polyconnect Bridge"
 version: "1.1.8"
 slug: "polyconnect_bridge"
 description: "Playwright bridge server for Polyconnect / Ingeli pool heat pumps."
-url: "https://github.com/your-user/ha-polyconnect"
+url: "https://github.com/fradinni/ha-polyconnect"
 arch:
   - amd64
   - aarch64
