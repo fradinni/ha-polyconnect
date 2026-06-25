@@ -1,5 +1,7 @@
 # Runtime secrets — never commit
+scripts/captured_ids.json
 scripts/captured_token.txt
+scripts/captured_token.txt.info
 captured_token.txt
 
 # Python
