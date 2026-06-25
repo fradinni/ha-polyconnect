@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Open the Polyconnect app in a visible Chromium window and capture device IDs.
+"""Open the Polyconnect app in a visible Chromium window.
 
-Discovers installation ID and heat pump ID by observing the Blazor app's
-internal navigation, then displays them in a friendly terminal UI.
+By default, opens the heat pump view for interactive browsing.
+With --capture-ids, discovers and saves installation/heat pump IDs.
 
 Usage:
-    pip install playwright
-    python3 -m playwright install chromium
-    python3 open-app.py
+    python3 open-app.py                  # just open the app
+    python3 open-app.py --capture-ids    # discover and save device IDs
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -41,6 +41,7 @@ USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
 )
+HEAT_PUMP_ID = "64140b25194618718c5083bd"
 
 # URL route patterns for ID extraction
 ROUTE_PATTERNS = {
@@ -62,17 +63,14 @@ class C:
     WHITE = "\033[97m"
 
 
-def banner():
-    print(f"""
-{C.CYAN}{C.BOLD}  Polyconnect — ID Discovery Tool{C.RESET}
-{C.CYAN}  {'─' * 40}{C.RESET}
-{C.DIM}  Opens the app in a browser and captures device IDs{C.RESET}
-""")
-
-
 def status(label: str, state: str, value: str | None = None):
     """Print a status line with icon."""
-    icons = {"wait": f"{C.YELLOW}◌{C.RESET}", "ok": f"{C.GREEN}●{C.RESET}", "err": f"{C.RED}✗{C.RESET}", "info": f"{C.CYAN}ℹ{C.RESET}"}
+    icons = {
+        "wait": f"{C.YELLOW}\u25cc{C.RESET}",
+        "ok": f"{C.GREEN}\u25cf{C.RESET}",
+        "err": f"{C.RED}\u2717{C.RESET}",
+        "info": f"{C.CYAN}\u2139{C.RESET}",
+    }
     icon = icons.get(state, " ")
     if value:
         print(f"  {icon}  {label:<22} {C.BOLD}{value}{C.RESET}")
@@ -148,23 +146,12 @@ class IDCapture:
         IDS_FILE.write_text(json.dumps(data, indent=2) + "\n")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Browser setup ─────────────────────────────────────────────────────────────
 
-def main() -> None:
-    sys.stdout.reconfigure(line_buffering=True)
-    banner()
-
-    token = load_token()
-    status("Token", "ok", f"{len(token)} chars")
-
-    capture = IDCapture()
-
-    # ── Launch browser ────────────────────────────────────────────────────────
-    status("Browser", "info", "launching Chromium...")
-
-    pw = sync_playwright().start()
+def launch_browser(pw, *, headless: bool = False):
+    """Launch Chromium with the required context (headers, cookies, UA)."""
     browser = pw.chromium.launch(
-        headless=False,
+        headless=headless,
         args=["--no-sandbox", "--disable-dev-shm-usage"],
     )
     ctx = browser.new_context(
@@ -175,14 +162,13 @@ def main() -> None:
     )
     ctx.add_cookies([AFFINITY_COOKIE])
     page = ctx.new_page()
+    return browser, page
 
-    # Blazor SPA uses pushState — page.url may lag behind window.location.href
 
-    # ── Load app ──────────────────────────────────────────────────────────────
-    status("App", "info", "loading with token...")
+def load_app(page, token: str) -> None:
+    """Navigate to the app and wait for Blazor to initialize."""
     page.goto(f"{BASE}/from-native/{token}", wait_until="domcontentloaded", timeout=30_000)
 
-    # Wait for Blazor runtime
     try:
         page.wait_for_function(
             "() => typeof Blazor !== 'undefined' && Blazor._internal",
@@ -190,11 +176,8 @@ def main() -> None:
         )
     except Exception:
         status("Blazor", "err", "runtime not detected")
-        browser.close()
-        pw.stop()
-        sys.exit(1)
+        raise SystemExit(1)
 
-    # Wait for initial render
     try:
         page.wait_for_selector(
             ".application-commons-mobile-display-mode, .co-gauge-container, "
@@ -205,41 +188,105 @@ def main() -> None:
         pass
     time.sleep(1)
 
-    # Check for auth failure
     body = page.evaluate("() => document.body.innerText.substring(0, 300)")
     if "403" in body or "must be connected" in body.lower():
-        status("Auth", "err", "token expired — run get-jwt.py to refresh")
+        status("Auth", "err", "token expired \u2014 run get-jwt.py to refresh")
+        raise SystemExit(1)
+
+
+def get_current_url(page) -> str:
+    """Get current URL via JS (catches Blazor pushState changes)."""
+    try:
+        return page.evaluate("() => window.location.href")
+    except Exception:
+        return ""
+
+
+# ── Mode: default (open app) ─────────────────────────────────────────────────
+
+def run_open(token: str) -> None:
+    """Open the heat pump view in a visible browser window."""
+    print(f"\n{C.CYAN}{C.BOLD}  Polyconnect{C.RESET}")
+    print(f"{C.CYAN}  {'─' * 40}{C.RESET}\n")
+
+    status("Token", "ok", f"{len(token)} chars")
+    status("Browser", "info", "launching...")
+
+    pw = sync_playwright().start()
+    browser, page = launch_browser(pw)
+
+    status("App", "info", "loading...")
+    load_app(page, token)
+    status("App", "ok", "loaded")
+
+    # Navigate to heat pump view
+    status("Navigation", "info", "heat pump view...")
+    page.evaluate(
+        f"Blazor._internal.navigationManager.navigateTo("
+        f"'{BASE}/heat-pump-view/{HEAT_PUMP_ID}', "
+        f"{{forceLoad: false, replaceHistoryEntry: false, historyEntryState: null}})"
+    )
+    try:
+        page.wait_for_selector(
+            ".co-gauge-container, .heat-pump-view-mode-container, "
+            ".order-and-value-item, .heat-pump-mode",
+            timeout=12_000,
+        )
+    except Exception:
+        pass
+    time.sleep(2)
+
+    status("Ready", "ok", "heat pump view displayed")
+    print(f"\n  {C.DIM}Press Ctrl+C or close the browser to exit.{C.RESET}\n")
+
+    try:
+        while browser.is_connected():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print(f"\n  {C.DIM}Shutting down...{C.RESET}")
+    finally:
         browser.close()
         pw.stop()
-        sys.exit(1)
 
+
+# ── Mode: --capture-ids ───────────────────────────────────────────────────────
+
+def run_capture_ids(token: str, *, headless: bool = True) -> None:
+    """Discover installation and heat pump IDs from the live app."""
+    print(f"\n{C.CYAN}{C.BOLD}  Polyconnect \u2014 ID Discovery{C.RESET}")
+    print(f"{C.CYAN}  {'─' * 40}{C.RESET}")
+    print(f"{C.DIM}  Opens the app and captures device IDs automatically{C.RESET}\n")
+
+    status("Token", "ok", f"{len(token)} chars")
+
+    capture = IDCapture()
+
+    mode_label = "headless" if headless else "visible"
+    status("Browser", "info", f"launching Chromium ({mode_label})...")
+    pw = sync_playwright().start()
+    browser, page = launch_browser(pw, headless=headless)
+
+    status("App", "info", "loading with token...")
+    load_app(page, token)
     status("App", "ok", "loaded successfully")
 
-    def get_current_url() -> str:
-        """Get current URL via JS (catches Blazor pushState changes faster)."""
-        try:
-            return page.evaluate("() => window.location.href")
-        except Exception:
-            return ""
+    # Installation ID from initial URL
+    capture.check_url(get_current_url(page))
 
-    # Check URL for installation ID (app auto-navigates to /installation-overview/{id})
-    capture.check_url(get_current_url())
-
-    # ── Navigate to heat pump view (click the device card) ────────────────────
+    # Click device card to navigate to heat-pump-view
     if not capture.ids["heat_pump_id"]:
         status("Navigation", "info", "clicking heat pump card...")
         try:
             page.click(".device-summary-item.mobile-clickable", force=True, timeout=8_000)
         except Exception:
             pass
-        # Blazor SPA navigation can take several seconds in non-headless mode
         for _ in range(30):
             time.sleep(0.5)
-            capture.check_url(get_current_url())
+            capture.check_url(get_current_url(page))
             if capture.ids["heat_pump_id"]:
                 break
 
-    # ── Display results ───────────────────────────────────────────────────────
+    # ── Results ───────────────────────────────────────────────────────────────
     print(f"\n{C.CYAN}  {'─' * 40}{C.RESET}")
     print(f"  {C.BOLD}Captured IDs{C.RESET}")
     print(f"{C.CYAN}  {'─' * 40}{C.RESET}")
@@ -248,24 +295,23 @@ def main() -> None:
     if capture.all_captured:
         capture.save()
         print(f"  {C.GREEN}{C.BOLD}All IDs captured successfully!{C.RESET}")
-        print(f"  {C.DIM}Saved to: {IDS_FILE}{C.RESET}")
-    else:
-        missing = [capture.labels[k] for k, v in capture.ids.items() if v is None]
-        print(f"  {C.YELLOW}Missing: {', '.join(missing)}{C.RESET}")
-        print(f"  {C.DIM}Navigate in the browser to discover remaining IDs.{C.RESET}")
-        print(f"  {C.DIM}The script monitors URL changes automatically.{C.RESET}")
+        print(f"  {C.DIM}Saved to: {IDS_FILE}{C.RESET}\n")
+        browser.close()
+        pw.stop()
+        return
 
-    print(f"\n{C.CYAN}  {'─' * 40}{C.RESET}")
-    print(f"  {C.DIM}Browser is open — navigate freely to explore.{C.RESET}")
-    print(f"  {C.DIM}Press Ctrl+C to close.{C.RESET}")
-    print()
+    # Not all captured yet — keep browser open and monitor
+    missing = [capture.labels[k] for k, v in capture.ids.items() if v is None]
+    print(f"  {C.YELLOW}Missing: {', '.join(missing)}{C.RESET}")
+    print(f"  {C.DIM}Navigate in the browser to discover remaining IDs.{C.RESET}")
+    print(f"  {C.DIM}The script monitors URL changes automatically.{C.RESET}")
+    print(f"\n  {C.DIM}Press Ctrl+C to close.{C.RESET}\n")
 
-    # ── Keep running and watch for new IDs ────────────────────────────────────
     try:
         prev_count = capture.captured_count
         while browser.is_connected():
             time.sleep(1)
-            capture.check_url(get_current_url())
+            capture.check_url(get_current_url(page))
             if capture.captured_count > prev_count:
                 prev_count = capture.captured_count
                 for key, val in capture.ids.items():
@@ -273,23 +319,53 @@ def main() -> None:
                         status(capture.labels[key], "ok", val)
                 if capture.all_captured:
                     capture.save()
-                    print(f"\n  {C.GREEN}{C.BOLD}All IDs captured!{C.RESET} Saved to {IDS_FILE}")
+                    print(f"\n  {C.GREEN}{C.BOLD}All IDs captured!{C.RESET} Saved to {IDS_FILE}\n")
+                    break
     except KeyboardInterrupt:
         print(f"\n  {C.DIM}Shutting down...{C.RESET}")
     finally:
-        # Save whatever we have
         if capture.captured_count > 0:
             capture.save()
         browser.close()
         pw.stop()
 
-    # Final summary
-    print(f"\n{C.CYAN}  {'─' * 40}{C.RESET}")
-    print(f"  {C.BOLD}Final Results{C.RESET}")
-    print(f"{C.CYAN}  {'─' * 40}{C.RESET}")
-    capture.print_status()
-    if IDS_FILE.exists():
-        print(f"  {C.DIM}File: {IDS_FILE}{C.RESET}\n")
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    sys.stdout.reconfigure(line_buffering=True)
+
+    parser = argparse.ArgumentParser(
+        description="Open the Polyconnect app in a visible Chromium window.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""\
+Examples:
+  python3 open-app.py                       Open the heat pump view
+  python3 open-app.py --capture-ids         Discover IDs (headless)
+  python3 open-app.py --capture-ids --show  Discover IDs (visible browser)
+
+Output:
+  IDs are saved to: {IDS_FILE}
+""",
+    )
+    parser.add_argument(
+        "--capture-ids",
+        action="store_true",
+        help="discover installation/heat pump IDs and save to captured_ids.json",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="show the browser window (--capture-ids runs headless by default)",
+    )
+    args = parser.parse_args()
+
+    token = load_token()
+
+    if args.capture_ids:
+        run_capture_ids(token, headless=not args.show)
+    else:
+        run_open(token)
 
 
 if __name__ == "__main__":
