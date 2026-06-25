@@ -1,0 +1,29 @@
+# Runtime secrets — never commit
+scripts/captured_token.txt
+captured_token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Playwright artifacts
+screenshot.png
+*.png
+
+# mitmproxy artifacts
+mitm_addon.py
+mitmproxy-ca-cert.pem
+*.pem
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

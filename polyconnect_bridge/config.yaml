@@ -1,0 +1,24 @@
+name: "Polyconnect Bridge"
+version: "1.1.8"
+slug: "polyconnect_bridge"
+description: "Playwright bridge server for Polyconnect / Ingeli pool heat pumps."
+url: "https://github.com/your-user/ha-polyconnect"
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: manual
+ingress: true
+ingress_port: 8765
+ports:
+  8765/tcp: null
+options:
+  token: ""
+  heat_pump_id: "64140b25194618718c5083bd"
+  log_level: "info"
+schema:
+  token: str
+  heat_pump_id: str
+  log_level: "list(trace|debug|info|warning|error)"
+environment:
+  PYTHONUNBUFFERED: "1"
