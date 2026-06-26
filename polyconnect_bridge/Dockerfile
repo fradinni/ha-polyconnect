@@ -12,20 +12,17 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # Install Playwright + Chromium with all system deps
 RUN playwright install chromium --with-deps
 
-# Cache-bust: bump this value to force re-copy of source files
-ARG CACHE_BUST=2.0.2
-
-# Copy addon files
-COPY run.sh /run.sh
-COPY server.py /server.py
-COPY capture_manager.py /capture_manager.py
-COPY mitm_addon.py /mitm_addon.py
-COPY setup_ui.py /setup_ui.py
-
-RUN chmod +x /run.sh
-
 # Ensure /data directory exists (Supervisor maps it, but ensure it exists for local dev)
 RUN mkdir -p /data
+
+# Copy ALL addon source in a single layer (any file change invalidates this layer)
+COPY . /app/
+RUN cp /app/run.sh /run.sh && chmod +x /run.sh && \
+    cp /app/server.py /server.py && \
+    cp /app/capture_manager.py /capture_manager.py && \
+    cp /app/mitm_addon.py /mitm_addon.py && \
+    cp /app/setup_ui.py /setup_ui.py && \
+    rm -rf /app/
 
 ENV PYTHONUNBUFFERED=1
 
