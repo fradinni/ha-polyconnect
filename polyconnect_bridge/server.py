@@ -837,6 +837,10 @@ def ingress_panel():
     """Serve the control panel visible through HA ingress."""
     # HA sets X-Ingress-Path header (e.g. /api/hassio_ingress/<token>)
     ingress_path = request.headers.get("X-Ingress-Path", "")
+    # Log all headers for debugging ingress issues
+    log.info("Ingress panel request headers: %s",
+             {k: v for k, v in request.headers if k.lower().startswith("x-")})
+    log.info("X-Ingress-Path=%r, Referer=%r", ingress_path, request.headers.get("Referer", ""))
     return Response(_build_ingress_html(ingress_path), mimetype="text/html")
 
 
@@ -845,7 +849,7 @@ def _build_ingress_html(ingress_path: str = "") -> str:
     phase = _capture_mgr.status.phase.value
     local_ip = _capture_mgr.status.local_ip or "detecting..."
     # Ensure base path ends with /
-    base_path = ingress_path.rstrip("/") + "/" if ingress_path else "./"
+    base_path = ingress_path.rstrip("/") + "/" if ingress_path else "/"
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -941,8 +945,30 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 </div>
 
 <script>
-// Base path injected from X-Ingress-Path header for HA ingress compatibility
-const BASE = '{base_path}';
+// Detect the correct base URL for API calls.
+// HA ingress serves this page at /api/hassio_ingress/<token>/
+// but the document context is the main HA page, so we need the absolute ingress path.
+const BASE = (() => {{
+    // Primary: server injected the X-Ingress-Path
+    const serverBase = '{base_path}';
+    if (serverBase && serverBase !== '/' && serverBase.includes('ingress')) {{
+        return serverBase;
+    }}
+    // Fallback: find ingress path from the page's fetch origin
+    // When loaded via ingress, HA frontend sets a data attribute or we can detect from script src
+    const scripts = document.querySelectorAll('script[src]');
+    for (const s of scripts) {{
+        const m = s.src.match(/(\\/api\\/hassio_ingress\\/[^/]+)/);
+        if (m) return m[1] + '/';
+    }}
+    // Last resort: try to find it from the browser history/referrer
+    const match = document.referrer && document.referrer.match(/(\\/api\\/hassio_ingress\\/[^/]+)/);
+    if (match) return match[1] + '/';
+    // If all else fails, use the server-provided value (might be just '/')
+    return serverBase;
+}})();
+
+console.log('[Polyconnect] BASE path:', BASE);
 
 function startCapture() {{
     fetch(BASE + 'capture/start', {{method: 'POST'}})
