@@ -1,4 +1,4 @@
 flask>=3.0.0
 playwright>=1.44.0
 mitmproxy>=10.0.0
-# v2.0.2
+setuptools>=70.0.0

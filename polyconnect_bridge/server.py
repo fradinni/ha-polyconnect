@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Polyconnect Bridge Server — HA Add-on v2.0.2
+"""Polyconnect Bridge Server — HA Add-on v2.0.3
 
 Features:
 - Persistent Chromium instance for controlling Polyconnect heat pumps
@@ -835,13 +835,18 @@ def capture_reset():
 @app.route("/")
 def ingress_panel():
     """Serve the control panel visible through HA ingress."""
-    return Response(_build_ingress_html(), mimetype="text/html")
+    # Extract HA host IP from the request (what the user types in their browser)
+    host_header = request.headers.get("Host", "")
+    ha_host_ip = host_header.split(":")[0] if host_header else ""
+    return Response(_build_ingress_html(ha_host_ip), mimetype="text/html")
 
 
-def _build_ingress_html() -> str:
+def _build_ingress_html(ha_host_ip: str = "") -> str:
     creds = _capture_mgr.credentials
     phase = _capture_mgr.status.phase.value
-    local_ip = _capture_mgr.status.local_ip or "detecting..."
+    # Use the HA host IP (what the user's browser connects to) for the phone URL
+    # Port 8080 is mapped from container to host by the Supervisor
+    phone_ip = ha_host_ip or "your-ha-ip"
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -878,7 +883,7 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 <body>
 <div class="container">
     <h1>Polyconnect Bridge</h1>
-    <p class="subtitle">v2.0.2 — Pool heat pump control via Playwright</p>
+    <p class="subtitle">v2.0.3 — Pool heat pump control via Playwright</p>
 
     <!-- Credentials Status -->
     <div class="card">
@@ -917,7 +922,7 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
         <div id="capture-section">
             <div class="phone-url">
                 <div class="label">Open this on your phone:</div>
-                <div class="url" id="phone-url">http://{local_ip}:8080</div>
+                <div class="url" id="phone-url">http://{phone_ip}:8080</div>
             </div>
             <div class="row">
                 <span class="label">Capture Phase</span>
@@ -940,38 +945,61 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 // Use document.baseURI which HA sets correctly for ingress panels,
 // or fall back to detecting from the iframe URL
 const BASE = (() => {{
-    // Check if we're in an iframe (HA ingress uses iframes)
     try {{
         if (window.location.pathname.includes('/api/hassio_ingress/')) {{
             return window.location.pathname.replace(/\\/?$/, '/');
         }}
     }} catch(e) {{}}
-    // Try document.baseURI
     try {{
         const base = new URL(document.baseURI);
         if (base.pathname.includes('/api/hassio_ingress/')) {{
             return base.pathname.replace(/\\/?$/, '/');
         }}
     }} catch(e) {{}}
-    // Last resort: use root (works when accessed directly on port 8765)
     return '/';
 }})();
 
-console.log('[Polyconnect] API base path:', BASE, 'location:', window.location.href);
+// HA host IP for phone URL (extracted from the page's host, same machine)
+const HA_HOST = window.location.hostname || '{phone_ip}';
 
 function startCapture() {{
+    const btn = document.getElementById('btn-start');
+    btn.disabled = true;
+    btn.textContent = 'Starting...';
+    btn.style.opacity = '0.6';
     fetch(BASE + 'capture/start', {{method: 'POST'}})
         .then(r => r.json())
-        .then(d => {{ if(d.ok) location.reload(); else alert(d.error || 'Failed'); }})
-        .catch(e => alert('Request failed: ' + e));
+        .then(d => {{
+            if (d.ok) {{
+                btn.textContent = 'Started! Loading...';
+                setTimeout(() => location.reload(), 1000);
+            }} else {{
+                btn.disabled = false;
+                btn.textContent = 'Start Capture';
+                btn.style.opacity = '1';
+                alert(d.error || 'Failed to start capture');
+            }}
+        }})
+        .catch(e => {{
+            btn.disabled = false;
+            btn.textContent = 'Start Capture';
+            btn.style.opacity = '1';
+            alert('Request failed: ' + e);
+        }});
 }}
 function stopCapture() {{
+    const btn = document.getElementById('btn-stop');
+    btn.disabled = true;
+    btn.textContent = 'Stopping...';
     fetch(BASE + 'capture/stop', {{method: 'POST'}})
         .then(r => r.json())
         .then(() => location.reload());
 }}
 function resetCredentials() {{
     if (!confirm('Clear all credentials? You will need to recapture them.')) return;
+    const btn = event.target;
+    btn.disabled = true;
+    btn.textContent = 'Clearing...';
     fetch(BASE + 'capture/reset', {{method: 'POST'}})
         .then(r => r.json())
         .then(() => location.reload());
@@ -992,15 +1020,15 @@ function pollStatus() {{
                 sec.style.display = 'block';
                 btnStart.style.display = 'none';
                 btnStop.style.display = 'inline-block';
+                // Use the HA host IP (same machine the user is connected to)
+                document.getElementById('phone-url').textContent =
+                    'http://' + HA_HOST + ':8080';
             }} else {{
                 sec.style.display = 'none';
                 btnStart.style.display = 'inline-block';
                 btnStop.style.display = 'none';
             }}
             document.getElementById('cap-phase').textContent = phase;
-            if (cap.local_ip) {{
-                document.getElementById('phone-url').textContent = 'http://' + cap.local_ip + ':8080';
-            }}
 
             // Auto-reload when capture completes
             if (phase === 'complete' || (d.credentials && d.credentials.complete)) {{
@@ -1019,7 +1047,7 @@ pollStatus();
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Starting Polyconnect Bridge v2.0.2 on port %d", PORT)
+    log.info("Starting Polyconnect Bridge v2.0.3 on port %d", PORT)
 
     if _capture_mgr.credentials.is_complete:
         log.info("Credentials loaded — launching Playwright browser")
