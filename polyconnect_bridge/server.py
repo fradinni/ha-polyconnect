@@ -937,26 +937,30 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 </div>
 
 <script>
+// Resolve base path for HA ingress compatibility (relative to current page)
+const BASE = new URL('.', window.location.href).href;
+
 function startCapture() {{
-    fetch('/capture/start', {{method: 'POST'}})
+    fetch(BASE + 'capture/start', {{method: 'POST'}})
         .then(r => r.json())
-        .then(d => {{ if(d.ok) location.reload(); else alert(d.error || 'Failed'); }});
+        .then(d => {{ if(d.ok) location.reload(); else alert(d.error || 'Failed'); }})
+        .catch(e => alert('Request failed: ' + e));
 }}
 function stopCapture() {{
-    fetch('/capture/stop', {{method: 'POST'}})
+    fetch(BASE + 'capture/stop', {{method: 'POST'}})
         .then(r => r.json())
         .then(() => location.reload());
 }}
 function resetCredentials() {{
     if (!confirm('Clear all credentials? You will need to recapture them.')) return;
-    fetch('/capture/reset', {{method: 'POST'}})
+    fetch(BASE + 'capture/reset', {{method: 'POST'}})
         .then(r => r.json())
         .then(() => location.reload());
 }}
 
 // Poll capture status
 function pollStatus() {{
-    fetch('/capture/status')
+    fetch(BASE + 'capture/status')
         .then(r => r.json())
         .then(d => {{
             const cap = d.capture || {{}};
