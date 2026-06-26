@@ -12,6 +12,9 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # Install Playwright + Chromium with all system deps
 RUN playwright install chromium --with-deps
 
+# Cache-bust: bump this value to force re-copy of source files
+ARG CACHE_BUST=2.0.2
+
 # Copy addon files
 COPY run.sh /run.sh
 COPY server.py /server.py
