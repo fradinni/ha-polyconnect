@@ -15,7 +15,11 @@ class PolyconnectError(Exception):
 
 
 class AuthExpiredError(PolyconnectError):
-    """Session token expired — user must refresh it in the add-on config."""
+    """Session token expired — user must recapture credentials."""
+
+
+class CredentialsMissingError(PolyconnectError):
+    """Credentials not yet captured — user must run the capture wizard."""
 
 
 class PolyconnectAPI:
@@ -37,10 +41,16 @@ class PolyconnectAPI:
         try:
             async with s.get(f"{self._bridge_url}{path}") as r:
                 if r.status == 401:
-                    raise AuthExpiredError("Token expired — update it in the add-on configuration")
+                    raise AuthExpiredError("Token expired — recapture needed")
+                if r.status == 503:
+                    data = await r.json()
+                    if data.get("credentials_missing"):
+                        raise CredentialsMissingError(
+                            "Credentials not configured — run capture in the add-on"
+                        )
                 r.raise_for_status()
                 return await r.json()
-        except AuthExpiredError:
+        except (AuthExpiredError, CredentialsMissingError):
             raise
         except aiohttp.ClientConnectorError as e:
             raise PolyconnectError(
@@ -55,10 +65,16 @@ class PolyconnectAPI:
         try:
             async with s.post(f"{self._bridge_url}{path}", json=data or {}) as r:
                 if r.status == 401:
-                    raise AuthExpiredError("Token expired — update it in the add-on configuration")
+                    raise AuthExpiredError("Token expired — recapture needed")
+                if r.status == 503:
+                    resp_data = await r.json()
+                    if resp_data.get("credentials_missing"):
+                        raise CredentialsMissingError(
+                            "Credentials not configured — run capture in the add-on"
+                        )
                 r.raise_for_status()
                 return await r.json()
-        except AuthExpiredError:
+        except (AuthExpiredError, CredentialsMissingError):
             raise
         except aiohttp.ClientConnectorError as e:
             raise PolyconnectError(
@@ -67,12 +83,18 @@ class PolyconnectAPI:
         except Exception as e:
             raise PolyconnectError(f"Request failed ({path}): {e}") from e
 
+    # ── Bridge API ────────────────────────────────────────────────────────────
+
     async def health_check(self) -> bool:
         try:
             data = await self._get("/health")
             return data.get("ok", False)
         except PolyconnectError:
             return False
+
+    async def get_health(self) -> dict[str, Any]:
+        """Full health response including credential status."""
+        return await self._get("/health")
 
     async def get_status(self) -> dict[str, Any]:
         return await self._get("/status")
@@ -94,6 +116,24 @@ class PolyconnectAPI:
 
     async def stop_filtration(self) -> None:
         await self._post("/filtration/stop")
+
+    # ── Capture API ───────────────────────────────────────────────────────────
+
+    async def get_capture_status(self) -> dict[str, Any]:
+        """Get the current capture status and credential state."""
+        return await self._get("/capture/status")
+
+    async def start_capture(self) -> dict[str, Any]:
+        """Start the credential capture process."""
+        return await self._post("/capture/start")
+
+    async def stop_capture(self) -> dict[str, Any]:
+        """Stop the credential capture process."""
+        return await self._post("/capture/stop")
+
+    async def reset_credentials(self) -> dict[str, Any]:
+        """Clear stored credentials and prepare for recapture."""
+        return await self._post("/capture/reset")
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

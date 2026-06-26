@@ -19,24 +19,17 @@ async def _detect_addon_url(hass: HomeAssistant) -> str | None:
     """Return the bridge add-on URL if it is installed and running.
 
     Uses the Supervisor REST API (only available on HA OS / Supervised).
-    Returns the direct container IP URL (more reliable than ingress, which
-    requires additional auth headers and an open ingress session).
-
-    The add-on slug has a repository-hash prefix (e.g. ``ecbbef75_polyconnect_bridge``)
-    that varies per installation, so we list all add-ons first and find the one whose
-    slug ends with ``_polyconnect_bridge`` rather than hard-coding the full slug.
+    Returns the direct container IP URL (more reliable than ingress).
     """
     try:
         import os
         import aiohttp
-        # SUPERVISOR_TOKEN is injected by the Supervisor into the HA Core container env
         supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
         if not supervisor_token:
             return None
         headers = {"Authorization": f"Bearer {supervisor_token}"}
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession() as s:
-            # Step 1: list installed add-ons to resolve the hash-prefixed slug
             async with s.get(
                 "http://supervisor/addons",
                 headers=headers,
@@ -54,7 +47,6 @@ async def _detect_addon_url(hass: HomeAssistant) -> str | None:
                     LOGGER.debug("Polyconnect Bridge add-on not found in installed add-ons")
                     return None
 
-            # Step 2: fetch the add-on details to get its container IP
             async with s.get(
                 f"http://supervisor/addons/{slug}/info",
                 headers=headers,
@@ -75,14 +67,13 @@ async def _detect_addon_url(hass: HomeAssistant) -> str | None:
 
 
 class PolyconnectConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Setup wizard — auto-detects the bridge add-on, or accepts a manual URL."""
+    """Setup wizard — auto-detects the bridge add-on, then checks credentials."""
 
     VERSION = 1
 
     async def async_step_user(self, user_input: dict | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
 
-        # Try to auto-detect the add-on URL for the default suggestion
         suggested_url = await _detect_addon_url(self.hass) or ADDON_DEFAULT_URL
 
         if user_input is not None:
@@ -91,8 +82,12 @@ class PolyconnectConfigFlow(ConfigFlow, domain=DOMAIN):
             url = user_input[CONF_BRIDGE_URL].rstrip("/")
             api = PolyconnectAPI(bridge_url=url)
             try:
-                if not await api.health_check():
+                health = await api.get_health()
+                if not health.get("ok"):
                     errors["base"] = "cannot_connect"
+                elif not health.get("credentials_configured"):
+                    # Bridge is running but credentials not captured yet
+                    errors["base"] = "credentials_missing"
             except PolyconnectError:
                 errors["base"] = "cannot_connect"
             except Exception:

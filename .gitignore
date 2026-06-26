@@ -21,8 +21,8 @@ venv/
 screenshot.png
 *.png
 
-# mitmproxy artifacts
-mitm_addon.py
+# mitmproxy artifacts (auto-generated in scripts/capture/, not the bridge copy)
+scripts/capture/mitm_addon.py
 mitmproxy-ca-cert.pem
 *.pem
 

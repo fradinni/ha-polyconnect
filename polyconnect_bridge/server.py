@@ -1,20 +1,47 @@
 #!/usr/bin/env python3
-"""Polyconnect Bridge Server — HA Add-on v1.1.5
+"""Polyconnect Bridge Server — HA Add-on v2.0.0
 
-Single persistent Chromium instance reused across all requests.
-Mode/preset changes take ~2-3 s. Setpoint uses mouse-drag (robust).
-Thread safety: a global Lock serialises all Playwright operations.
-If the browser crashes it is relaunched transparently on the next call.
+Features:
+- Persistent Chromium instance for controlling Polyconnect heat pumps
+- Integrated credential capture via mitmproxy (start/stop from HA ingress)
+- Credentials stored in /data/ (persistent across add-on updates)
+
+Ports:
+- 8765: Main API (HA ingress) — bridge REST + capture control + control panel
+- 8080: Phone-facing setup UI (only during capture)
+- 8888: mitmproxy (only during capture)
 """
-import math, os, logging, threading, time, json, sys
-from flask import Flask, jsonify, request
+from __future__ import annotations
 
-TOKEN     = os.environ.get("POLYCONNECT_TOKEN", "")
-HEAT_PUMP          = os.environ.get("POLYCONNECT_HEAT_PUMP_ID", "64140b25194618718c5083bd")
-INSTALLATION_ID    = os.environ.get("POLYCONNECT_INSTALLATION_ID",
-                        HEAT_PUMP[:-1] + chr(ord(HEAT_PUMP[-1]) + 1))
+import math, os, logging, threading, time, json, sys
+from flask import Flask, jsonify, request, Response
+from pathlib import Path
+
+from capture_manager import CaptureManager, DATA_DIR
+
+# ── Credential loading (from /data/ persistent storage) ───────────────────────
+
+_capture_mgr = CaptureManager()
+
+# Load credentials — these update dynamically after capture
+def _get_token() -> str:
+    """Get current token — re-reads from manager (may update after capture)."""
+    return _capture_mgr.credentials.token or ""
+
+def _get_heat_pump_id() -> str:
+    return _capture_mgr.credentials.heat_pump_id or ""
+
+def _get_installation_id() -> str:
+    inst = _capture_mgr.credentials.installation_id or ""
+    if not inst and _get_heat_pump_id():
+        # Fallback: derive from heat_pump_id (often differs by last char)
+        hp = _get_heat_pump_id()
+        inst = hp[:-1] + chr(ord(hp[-1]) + 1)
+    return inst
+
+
 LOG_LEVEL = os.environ.get("POLYCONNECT_LOG_LEVEL", "info").upper()
-PORT      = int(os.environ.get("PORT", 8765))
+PORT = int(os.environ.get("PORT", 8765))
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -42,7 +69,7 @@ _STATUS_JS = """
     };
     const textOf = (el) => el ? el.textContent.trim() : null;
 
-    // Water temperature — .order-and-value-value-number when not '-'
+    // Water temperature
     let waterTemp = null;
     for (const el of document.querySelectorAll(
         '.order-and-value-value-number, [class*="value-number"], ' +
@@ -65,7 +92,7 @@ _STATUS_JS = """
         if (v !== null && v >= 8 && v <= 32) { setpointTemp = v; break; }
     }
 
-    // Outside temperature — topbar-weather widget (primary)
+    // Outside temperature
     let outsideTemp = null;
     const weather = document.querySelector('.topbar-weather');
     if (weather) {
@@ -82,7 +109,7 @@ _STATUS_JS = """
         }
     }
 
-    // Operating mode (main: Chauffage / Froid / Automatique)
+    // Operating mode
     const MAIN_MODES = ['Chauffage', 'Froid', 'Automatique'];
     let operatingMode = null;
     for (const el of document.querySelectorAll('.state-button-value, [class*="mode-label"]')) {
@@ -116,7 +143,7 @@ _STATUS_JS = """
         for (const m of MAIN_MODES) { if (body.includes(m)) { operatingMode = m; break; } }
     }
 
-    // Regulation mode (preset: Eco / Smart / Boost)
+    // Regulation mode
     const REG_MODES = ['Eco', 'Smart', 'Boost'];
     let regulationMode = null;
     for (const el of document.querySelectorAll('.state-button-value, [class*="power-mode"]')) {
@@ -141,7 +168,7 @@ _STATUS_JS = """
         for (const m of REG_MODES) { if (body.includes(m)) { regulationMode = m; break; } }
     }
 
-    // Heat pump on/off state
+    // Heat pump on/off
     let heatPumpActive = null;
     const btn = document.querySelector('.heat-pump-on-off button, .co-on-off-button, [class*="on-off"] button');
     if (btn) {
@@ -151,8 +178,8 @@ _STATUS_JS = """
     }
     if (heatPumpActive === null) {
         const body = document.body.innerText;
-        if (/\bON\b/.test(body)) heatPumpActive = true;
-        else if (/\bOFF\b/.test(body)) heatPumpActive = false;
+        if (/\\bON\\b/.test(body)) heatPumpActive = true;
+        else if (/\\bOFF\\b/.test(body)) heatPumpActive = false;
     }
 
     // Compressor
@@ -164,14 +191,11 @@ _STATUS_JS = """
         if (body.includes('compresseur') && body.includes('en marche')) compressorRunning = true;
     }
 
-    // Filtration — scan multiple possible selectors
+    // Filtration
     let filtrationRunning = false;
     const filtSelectors = [
-        '[class*="filtration"] button',
-        '[class*="filtration"][class*="toggle"]',
-        '[class*="filtration"][class*="btn"]',
-        '[class*="pompe-filtration"]',
-        '[class*="pump-status"]',
+        '[class*="filtration"] button', '[class*="filtration"][class*="toggle"]',
+        '[class*="filtration"][class*="btn"]', '[class*="pompe-filtration"]', '[class*="pump-status"]',
     ];
     for (const sel of filtSelectors) {
         const el = document.querySelector(sel);
@@ -250,6 +274,13 @@ class PolyconnectController:
 
     def _launch(self):
         from playwright.sync_api import sync_playwright
+        token = _get_token()
+        heat_pump = _get_heat_pump_id()
+        if not token:
+            raise RuntimeError("No session token configured — run capture first")
+        if not heat_pump:
+            raise RuntimeError("No heat pump ID configured — run capture first")
+
         if self._pw:
             try: self._pw.stop()
             except: pass
@@ -265,8 +296,10 @@ class PolyconnectController:
         self._load_app()
 
     def _load_app(self):
+        token = _get_token()
+        heat_pump = _get_heat_pump_id()
         page = self._page
-        page.goto(f"{BASE}/from-native/{TOKEN}", wait_until="domcontentloaded", timeout=30_000)
+        page.goto(f"{BASE}/from-native/{token}", wait_until="domcontentloaded", timeout=30_000)
         try:
             page.wait_for_function(
                 "() => typeof Blazor !== 'undefined' && Blazor._internal",
@@ -275,10 +308,10 @@ class PolyconnectController:
             pass
         body = page.evaluate("() => document.body.innerText.substring(0, 200)")
         if "403" in body or "must be connected" in body.lower():
-            raise RuntimeError("Session token expired — update it in the add-on options")
+            raise RuntimeError("Session token expired — recapture needed")
         page.evaluate(
             f"Blazor._internal.navigationManager.navigateTo("
-            f"'{BASE}/heat-pump-view/{HEAT_PUMP}', false)")
+            f"'{BASE}/heat-pump-view/{heat_pump}', false)")
         try:
             page.wait_for_selector(
                 ".co-gauge-container, .heat-pump-view-mode-container, "
@@ -290,26 +323,18 @@ class PolyconnectController:
         log.info("Browser launched and heat pump view loaded")
 
     def _ensure(self):
-        """Launch or re-launch the browser if necessary."""
         if self._browser and self._browser.is_connected():
             return
         log.info("(Re-)launching browser …")
         self._launch()
 
     def _ensure_view(self):
-        """Navigate back to heat pump view; detect 403 token expiry.
-
-        The Blazor SPA keeps the original URL even after auth failure, so we must
-        inspect the page body — not just the URL — to detect expiry. On 403 we
-        close the browser (so the next _ensure() re-launches with a fresh token)
-        and raise RuntimeError so _safe() returns 401 to HA.
-        """
-        # 403 check — runs every request, inexpensive (just reads innerText)
+        heat_pump = _get_heat_pump_id()
         try:
             snippet = self._page.evaluate(
                 "() => document.body.innerText.substring(0, 120)")
             if "403" in snippet or "must be connected" in snippet.lower():
-                log.warning("Session token expired — closing browser for re-launch")
+                log.warning("Session token expired — closing browser")
                 try:
                     self._browser.close()
                     self._pw.stop()
@@ -318,17 +343,16 @@ class PolyconnectController:
                 self._browser = None
                 self._pw      = None
                 self._page    = None
-                raise RuntimeError(
-                    "Session token expired — update it in the add-on options")
+                raise RuntimeError("Session token expired — recapture needed")
         except RuntimeError:
             raise
         except Exception:
-            pass  # evaluate may fail transiently; treat as recoverable
+            pass
 
         if "heat-pump-view" not in self._page.url:
             self._page.evaluate(
                 f"Blazor._internal.navigationManager.navigateTo("
-                f"'{BASE}/heat-pump-view/{HEAT_PUMP}', false)")
+                f"'{BASE}/heat-pump-view/{heat_pump}', false)")
             try:
                 self._page.wait_for_selector(
                     ".co-gauge-container, .heat-pump-view-mode-container",
@@ -350,10 +374,11 @@ class PolyconnectController:
     def set_mode(self, mode: str) -> dict:
         with self._lock:
             self._ensure()
+            heat_pump = _get_heat_pump_id()
             page = self._page
-            edit_url = (f"{BASE}/heat-pump-edit-mode/{HEAT_PUMP}"
+            edit_url = (f"{BASE}/heat-pump-edit-mode/{heat_pump}"
                         if mode in MAIN_MODES
-                        else f"{BASE}/heat-pump-edit-power-mode/{HEAT_PUMP}")
+                        else f"{BASE}/heat-pump-edit-power-mode/{heat_pump}")
 
             log.info("set_mode %s → navigating to edit page", mode)
             page.evaluate(
@@ -401,7 +426,6 @@ class PolyconnectController:
                     f"button.control-selected:has-text('{mode}'), "
                     f"button[class*='control-selected']:has-text('{mode}')",
                     timeout=3_000)
-                log.info("Mode button confirmed selected: %s", mode)
             except Exception:
                 time.sleep(0.8)
 
@@ -412,10 +436,9 @@ class PolyconnectController:
             except Exception:
                 pass
 
-            log.info("Navigating back to heat pump view")
             page.evaluate(
                 f"Blazor._internal.navigationManager.navigateTo("
-                f"'{BASE}/heat-pump-view/{HEAT_PUMP}',"
+                f"'{BASE}/heat-pump-view/{heat_pump}',"
                 f"{{forceLoad:false,replaceHistoryEntry:false,historyEntryState:null}})")
             try:
                 page.wait_for_selector(
@@ -436,14 +459,13 @@ class PolyconnectController:
                         f"() => document.querySelector('.{expected}') !== null && "
                         f"document.querySelector('.{expected}').offsetParent !== null",
                         timeout=4_000)
-                    log.info("Mode icon %s confirmed in DOM", expected)
                 except Exception:
                     time.sleep(1.5)
             else:
                 time.sleep(2.0)
             return {"ok": True}
 
-    # ── set_setpoint (mouse-drag — proven reliable) ───────────────────────────
+    # ── set_setpoint ──────────────────────────────────────────────────────────
 
     def set_setpoint(self, temp: float) -> dict:
         with self._lock:
@@ -470,7 +492,7 @@ class PolyconnectController:
             })()""")
 
             if not info:
-                log.warning("Temperature slider not found in DOM (alarm state or page not loaded)")
+                log.warning("Temperature slider not found in DOM")
                 return {"ok": True, "note": "slider not found in DOM"}
 
             current = info["current"]
@@ -478,7 +500,6 @@ class PolyconnectController:
             log.info("Setpoint: current=%s target=%s diff=%s", current, target, diff)
 
             if diff == 0:
-                log.info("Setpoint already at %s — no action", target)
                 return {"ok": True, "note": "already at target"}
 
             gcx, gcy = info["gcx"], info["gcy"]
@@ -508,7 +529,6 @@ class PolyconnectController:
                 log.info("Setpoint validated: %s°C", temp)
             except Exception:
                 page.evaluate("() => { const b = document.querySelector('.order-validation-validate'); if (b) b.click(); }")
-                log.info("Setpoint validate JS fallback: %s°C", temp)
             time.sleep(1.0)
             return {"ok": True}
 
@@ -516,7 +536,6 @@ class PolyconnectController:
 
     def _get_active(self) -> bool | None:
         return self._page.evaluate("""() => {
-            // Primary: CSS class selectors (standard Polyconnect layout)
             const btn = document.querySelector(
                 '.heat-pump-on-off button, .co-on-off-button, [class*="on-off"] button');
             if (btn) {
@@ -524,7 +543,6 @@ class PolyconnectController:
                 if (p !== null) return p === 'true';
                 return btn.classList.contains('istd-sty-active') || btn.classList.contains('active');
             }
-            // Fallback: find button whose visible text is exactly "ON" or "OFF"
             for (const b of document.querySelectorAll('button')) {
                 const t = b.textContent.trim().toUpperCase();
                 if (t === 'ON' || t === 'OFF') {
@@ -538,7 +556,6 @@ class PolyconnectController:
 
     def _click_power(self):
         page = self._page
-        # Primary: CSS class selectors
         for sel in [".heat-pump-on-off button", ".co-on-off-button", "[class*='on-off'] button"]:
             try:
                 page.click(sel, timeout=3_000)
@@ -546,32 +563,23 @@ class PolyconnectController:
                 return
             except Exception:
                 pass
-        # Fallback: find button by visible text "ON" / "OFF" (Polyconnect uses plain text labels)
         result = page.evaluate("""() => {
             for (const b of document.querySelectorAll('button')) {
                 const t = b.textContent.trim().toUpperCase();
-                if (t === 'ON' || t === 'OFF') {
-                    b.click();
-                    return 'text:' + b.textContent.trim().substring(0, 8);
-                }
+                if (t === 'ON' || t === 'OFF') { b.click(); return 'text:' + t; }
             }
-            // Broader: any power/switch-related element
             for (const b of document.querySelectorAll('[class*="power"] button, [class*="switch"] button')) {
-                b.click();
-                return 'class:' + b.className.substring(0, 40);
+                b.click(); return 'class:' + b.className.substring(0, 40);
             }
             return null;
         }""")
         if result:
             log.info("Power clicked via JS fallback: %s", result)
-        else:
-            log.warning("Power button not found in DOM — check CSS selectors")
 
     def turn_on(self) -> dict:
         with self._lock:
             self._ensure(); self._ensure_view()
             is_on = self._get_active()
-            log.info("turn_on: current active=%s", is_on)
             if is_on is True:
                 return {"ok": True, "note": "already ON"}
             self._click_power()
@@ -582,7 +590,6 @@ class PolyconnectController:
         with self._lock:
             self._ensure(); self._ensure_view()
             is_on = self._get_active()
-            log.info("turn_off: current active=%s", is_on)
             if is_on is False:
                 return {"ok": True, "note": "already OFF"}
             self._click_power()
@@ -590,19 +597,13 @@ class PolyconnectController:
             return {"ok": True}
 
     # ── filtration ────────────────────────────────────────────────────────────
-    # Filtration may be on heat-pump-view OR installation-overview page.
-    # We scan both and log whatever we find to identify the correct selector.
 
     def _scan_filtration_buttons(self) -> dict:
-        """Scan current page for filtration controls. Returns {found, sel, state, buttons}."""
         return self._page.evaluate("""() => {
             const SELS = [
-                '[class*="filtration"] button',
-                'button[class*="filtration"]',
-                '[class*="filtration"][class*="toggle"]',
-                '[class*="pompe-filtration"]',
-                '[id*="filtration"]',
-                '[class*="filtration"][class*="switch"]',
+                '[class*="filtration"] button', 'button[class*="filtration"]',
+                '[class*="filtration"][class*="toggle"]', '[class*="pompe-filtration"]',
+                '[id*="filtration"]', '[class*="filtration"][class*="switch"]',
             ];
             for (const sel of SELS) {
                 const el = document.querySelector(sel);
@@ -614,7 +615,6 @@ class PolyconnectController:
                     return {found: true, sel, state, cls: el.className.substring(0,120)};
                 }
             }
-            // Broad: any button with filtration/pompe text
             for (const b of document.querySelectorAll('button')) {
                 const t = b.textContent.trim().toLowerCase();
                 const c = b.className.toLowerCase();
@@ -627,14 +627,12 @@ class PolyconnectController:
                             state, cls: b.className.substring(0,120)};
                 }
             }
-            // Not found — list all button texts for debugging
             const btns = Array.from(document.querySelectorAll('button'))
                 .map(b => b.textContent.trim().substring(0,30)).filter(t => t).slice(0,20);
             return {found: false, buttons: btns};
         }""")
 
     def _click_found_filtration(self, scan_result: dict):
-        """Click a filtration button from a scan result."""
         page = self._page
         sel = scan_result.get('sel', '')
         if sel == 'broad':
@@ -643,123 +641,63 @@ class PolyconnectController:
                 "(t => { for (const b of document.querySelectorAll('button')) {"
                 "  if (b.textContent.trim().startsWith(t.substring(0,15))) { b.click(); return; }"
                 "} })(" + repr(text) + ")")
-            log.info("Filtration broad-click: text=%r", text)
         else:
             try:
                 page.click(sel, timeout=3_000)
-                log.info("Filtration clicked: %s", sel)
             except Exception:
                 page.evaluate("(s => { const b = document.querySelector(s); if (b) b.click(); })(" + repr(sel) + ")")
-                log.info("Filtration JS-click: %s", sel)
 
     def _toggle_filtration(self, want_on: bool) -> dict:
         page = self._page
+        installation_id = _get_installation_id()
+        heat_pump = _get_heat_pump_id()
 
-        # 1. Try heat pump view (already loaded)
         result = self._scan_filtration_buttons()
-        log.info("Filtration scan heat-pump-view: %s", result)
         if result.get('found'):
             is_on = result.get('state', False)
             if (want_on and is_on) or (not want_on and not is_on):
                 return {"ok": True, "note": f"already {'running' if want_on else 'stopped'}"}
             self._click_found_filtration(result)
             time.sleep(2.0)
-            after = self._scan_filtration_buttons()
-            log.info("Filtration after click: %s", after)
             return {"ok": True}
 
-        # 2. Try installation overview
-        log.info("Filtration not on heat-pump-view → trying installation-overview (%s)", INSTALLATION_ID)
+        # Try installation overview
         page.evaluate(
             f"Blazor._internal.navigationManager.navigateTo("
-            f"'{BASE}/installation-overview/{INSTALLATION_ID}', false)")
+            f"'{BASE}/installation-overview/{installation_id}', false)")
         try:
             page.wait_for_selector('[class*="filtration"], [class*="pompe"], button', timeout=10_000)
         except Exception:
             time.sleep(3)
         result2 = self._scan_filtration_buttons()
-        log.info("Filtration scan installation-overview: %s", result2)
         if result2.get('found'):
             is_on = result2.get('state', False)
             if not ((want_on and is_on) or (not want_on and not is_on)):
                 self._click_found_filtration(result2)
                 time.sleep(2.0)
-            # Navigate back
             page.evaluate(
                 f"Blazor._internal.navigationManager.navigateTo("
-                f"'{BASE}/heat-pump-view/{HEAT_PUMP}', false)")
+                f"'{BASE}/heat-pump-view/{heat_pump}', false)")
             try:
                 page.wait_for_selector(".co-gauge-container, .heat-pump-view-mode-container", timeout=8_000)
             except Exception:
                 time.sleep(2)
             return {"ok": True}
         else:
-            log.warning("Filtration button NOT found anywhere. Page buttons: %s", result2.get('buttons', []))
-            # Navigate back regardless
             page.evaluate(
                 f"Blazor._internal.navigationManager.navigateTo("
-                f"'{BASE}/heat-pump-view/{HEAT_PUMP}', false)")
-            return {"ok": True, "note": "filtration button not found in DOM — check add-on logs"}
+                f"'{BASE}/heat-pump-view/{heat_pump}', false)")
+            return {"ok": True, "note": "filtration button not found"}
 
     def start_filtration(self) -> dict:
         with self._lock:
-            self._ensure()
-            self._ensure_view()
+            self._ensure(); self._ensure_view()
             return self._toggle_filtration(want_on=True)
 
     def stop_filtration(self) -> dict:
         with self._lock:
-            self._ensure()
-            self._ensure_view()
+            self._ensure(); self._ensure_view()
             return self._toggle_filtration(want_on=False)
-
-
-
-    def debug_power_dom(self) -> dict:
-        """Non-destructive DOM scan of the power button area."""
-        with self._lock:
-            self._ensure()
-            self._ensure_view()
-            return self._page.evaluate("""() => {
-                const CSS_SELS = [
-                    '.heat-pump-on-off button', '.co-on-off-button',
-                    '[class*="on-off"] button', '[class*="power"] button',
-                    '[class*="switch"] button',
-                ];
-                const cssMatches = [];
-                for (const sel of CSS_SELS) {
-                    const el = document.querySelector(sel);
-                    if (el) cssMatches.push({sel, tag: el.tagName,
-                        cls: el.className.substring(0,80),
-                        text: el.textContent.trim().substring(0,30),
-                        ariaPressed: el.getAttribute('aria-pressed')});
-                }
-                const allBtns = Array.from(document.querySelectorAll('button')).map(b => ({
-                    textRaw: JSON.stringify(b.textContent.substring(0, 40)),
-                    textTrimmed: b.textContent.trim().substring(0, 30),
-                    cls: b.className.substring(0, 80),
-                    ariaPressed: b.getAttribute('aria-pressed'),
-                    id: b.id || null,
-                    visible: b.offsetParent !== null,
-                }));
-                let textActive = null;
-                for (const b of document.querySelectorAll('button')) {
-                    const t = b.textContent.trim().toUpperCase();
-                    if (t === 'ON' || t === 'OFF') {
-                        const p = b.getAttribute('aria-pressed');
-                        textActive = {found: true, text: t,
-                            ariaPressed: p, cls: b.className.substring(0, 80),
-                            state: p !== null ? p === 'true' : t === 'ON'};
-                        break;
-                    }
-                }
-                return {
-                    url: window.location.href.split('/').slice(-2).join('/'),
-                    cssMatches, allBtns,
-                    textActive: textActive || {found: false},
-                    bodySnippet: document.body.innerText.substring(0, 300),
-                };
-            }""")
 
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
@@ -767,27 +705,39 @@ class PolyconnectController:
 ctrl = PolyconnectController()
 app  = Flask(__name__)
 
+_setup_server = None  # reference to the phone-facing HTTP server
+
 
 def _safe(fn, *a, **kw):
     try:
         return fn(*a, **kw), 200
     except RuntimeError as e:
-        if "expired" in str(e).lower():
+        if "expired" in str(e).lower() or "recapture" in str(e).lower():
             return {"error": str(e), "auth_expired": True}, 401
+        if "no session token" in str(e).lower() or "no heat pump" in str(e).lower():
+            return {"error": str(e), "credentials_missing": True}, 503
         return {"error": str(e)}, 500
     except Exception as e:
         log.exception("Unhandled error in %s", fn.__name__)
         return {"error": str(e)}, 500
 
 
+# ── Bridge API routes (existing) ──────────────────────────────────────────────
+
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "service": "polyconnect-bridge",
-                    "version": "1.1.8", "token_configured": bool(TOKEN)})
+    creds = _capture_mgr.credentials
+    return jsonify({
+        "ok": True,
+        "service": "polyconnect-bridge",
+        "version": "2.0.0",
+        "credentials_configured": creds.is_complete,
+        "capture_phase": _capture_mgr.status.phase.value,
+    })
 
 
 @app.route("/status")
-def status():
+def get_status():
     data, code = _safe(ctrl.get_status)
     return jsonify(data), code
 
@@ -834,19 +784,227 @@ def filtration_stop():
     data, code = _safe(ctrl.stop_filtration)
     return jsonify(data), code
 
-@app.route("/debug/power")
-def debug_power():
-    data, code = _safe(ctrl.debug_power_dom)
-    return jsonify(data), code
 
+# ── Capture API routes (new) ──────────────────────────────────────────────────
+
+@app.route("/capture/status")
+def capture_status():
+    return jsonify(_capture_mgr.get_status())
+
+
+@app.route("/capture/start", methods=["POST"])
+def capture_start():
+    global _setup_server
+    result = _capture_mgr.start_capture()
+    if result.get("ok") and _setup_server is None:
+        from setup_ui import start_setup_server
+        _setup_server = start_setup_server(_capture_mgr)
+        log.info("Setup UI server started on port 8080")
+    return jsonify(result)
+
+
+@app.route("/capture/stop", methods=["POST"])
+def capture_stop():
+    global _setup_server
+    result = _capture_mgr.stop_capture()
+    if _setup_server:
+        from setup_ui import stop_setup_server
+        stop_setup_server(_setup_server)
+        _setup_server = None
+        log.info("Setup UI server stopped")
+    return jsonify(result)
+
+
+@app.route("/capture/reset", methods=["POST"])
+def capture_reset():
+    global _setup_server
+    # Stop capture if running
+    if _capture_mgr.status.phase.value != "idle":
+        _capture_mgr.stop_capture()
+        if _setup_server:
+            from setup_ui import stop_setup_server
+            stop_setup_server(_setup_server)
+            _setup_server = None
+    # Clear credentials
+    _capture_mgr.reset_credentials()
+    return jsonify({"ok": True, "message": "Credentials cleared. Start capture to recapture."})
+
+
+# ── Ingress Control Panel (HTML at /) ─────────────────────────────────────────
+
+@app.route("/")
+def ingress_panel():
+    """Serve the control panel visible through HA ingress."""
+    return Response(_build_ingress_html(), mimetype="text/html")
+
+
+def _build_ingress_html() -> str:
+    creds = _capture_mgr.credentials
+    phase = _capture_mgr.status.phase.value
+    local_ip = _capture_mgr.status.local_ip or "detecting..."
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polyconnect Bridge</title>
+<style>
+:root {{ --bg: #1a1a2e; --surface: #16213e; --border: #0f3460; --text: #e4e4e4; --dim: #8b8b8b; --accent: #0ea5e9; --green: #4ade80; --yellow: #fbbf24; --red: #f87171; }}
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); padding:1.5rem; min-height:100vh; }}
+.container {{ max-width:600px; margin:0 auto; }}
+h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
+.subtitle {{ color:var(--dim); font-size:0.82rem; margin-bottom:1.5rem; }}
+.card {{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin-bottom:1rem; }}
+.card h2 {{ font-size:0.9rem; color:var(--accent); margin-bottom:0.7rem; }}
+.row {{ display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; }}
+.row .label {{ color:var(--dim); font-size:0.8rem; }}
+.row .value {{ font-size:0.8rem; font-family:monospace; }}
+.ok {{ color:var(--green); }}
+.warn {{ color:var(--yellow); }}
+.err {{ color:var(--red); }}
+.btn {{ display:inline-block; padding:0.6rem 1.2rem; border-radius:8px; font-size:0.82rem; font-weight:600; border:none; cursor:pointer; margin-right:0.5rem; margin-top:0.5rem; }}
+.btn-primary {{ background:var(--accent); color:white; }}
+.btn-danger {{ background:var(--red); color:white; }}
+.btn-outline {{ background:transparent; border:1px solid var(--border); color:var(--text); }}
+.btn:hover {{ opacity:0.9; }}
+.phone-url {{ background:var(--bg); border:1px solid var(--accent); border-radius:8px; padding:0.8rem; text-align:center; margin:0.8rem 0; }}
+.phone-url .label {{ font-size:0.7rem; color:var(--dim); text-transform:uppercase; }}
+.phone-url .url {{ font-size:1.1rem; font-weight:700; color:var(--accent); font-family:monospace; }}
+#capture-section {{ display: {"block" if phase != "idle" else "none"}; }}
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>Polyconnect Bridge</h1>
+    <p class="subtitle">v2.0.0 — Pool heat pump control via Playwright</p>
+
+    <!-- Credentials Status -->
+    <div class="card">
+        <h2>Credentials</h2>
+        <div class="row">
+            <span class="label">Token</span>
+            <span class="value {'ok' if creds.token else 'warn'}">{'Configured (' + str(len(creds.token)) + ' chars)' if creds.token else 'Not captured'}</span>
+        </div>
+        <div class="row">
+            <span class="label">Heat Pump ID</span>
+            <span class="value {'ok' if creds.heat_pump_id else 'warn'}">{creds.heat_pump_id or 'Not captured'}</span>
+        </div>
+        <div class="row">
+            <span class="label">Installation ID</span>
+            <span class="value {'ok' if creds.installation_id else 'warn'}">{creds.installation_id or 'Not captured'}</span>
+        </div>
+        <div class="row">
+            <span class="label">Status</span>
+            <span class="value {'ok' if creds.is_complete else 'warn'}">{'Ready' if creds.is_complete else 'Incomplete — capture needed'}</span>
+        </div>
+    </div>
+
+    <!-- Capture Controls -->
+    <div class="card">
+        <h2>Credential Capture</h2>
+        <p style="color:var(--dim); font-size:0.8rem; margin-bottom:0.8rem;">
+            Capture your Polyconnect credentials by proxying your phone's traffic.
+            This requires your phone to be on the same WiFi network.
+        </p>
+        <div>
+            <button class="btn btn-primary" onclick="startCapture()" id="btn-start">Start Capture</button>
+            <button class="btn btn-outline" onclick="stopCapture()" id="btn-stop" style="display:none;">Stop Capture</button>
+            <button class="btn btn-danger" onclick="resetCredentials()">Reset Credentials</button>
+        </div>
+
+        <div id="capture-section">
+            <div class="phone-url">
+                <div class="label">Open this on your phone:</div>
+                <div class="url" id="phone-url">http://{local_ip}:8080</div>
+            </div>
+            <div class="row">
+                <span class="label">Capture Phase</span>
+                <span class="value" id="cap-phase">{phase}</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bridge Status -->
+    <div class="card">
+        <h2>Bridge</h2>
+        <div class="row">
+            <span class="label">Playwright</span>
+            <span class="value" id="bridge-status">{'Ready' if creds.is_complete else 'Waiting for credentials'}</span>
+        </div>
+    </div>
+</div>
+
+<script>
+function startCapture() {{
+    fetch('/capture/start', {{method: 'POST'}})
+        .then(r => r.json())
+        .then(d => {{ if(d.ok) location.reload(); else alert(d.error || 'Failed'); }});
+}}
+function stopCapture() {{
+    fetch('/capture/stop', {{method: 'POST'}})
+        .then(r => r.json())
+        .then(() => location.reload());
+}}
+function resetCredentials() {{
+    if (!confirm('Clear all credentials? You will need to recapture them.')) return;
+    fetch('/capture/reset', {{method: 'POST'}})
+        .then(r => r.json())
+        .then(() => location.reload());
+}}
+
+// Poll capture status
+function pollStatus() {{
+    fetch('/capture/status')
+        .then(r => r.json())
+        .then(d => {{
+            const cap = d.capture || {{}};
+            const phase = cap.phase || 'idle';
+            const sec = document.getElementById('capture-section');
+            const btnStart = document.getElementById('btn-start');
+            const btnStop = document.getElementById('btn-stop');
+
+            if (phase === 'running' || phase === 'complete') {{
+                sec.style.display = 'block';
+                btnStart.style.display = 'none';
+                btnStop.style.display = 'inline-block';
+            }} else {{
+                sec.style.display = 'none';
+                btnStart.style.display = 'inline-block';
+                btnStop.style.display = 'none';
+            }}
+            document.getElementById('cap-phase').textContent = phase;
+            if (cap.local_ip) {{
+                document.getElementById('phone-url').textContent = 'http://' + cap.local_ip + ':8080';
+            }}
+
+            // Auto-reload when capture completes
+            if (phase === 'complete' || (d.credentials && d.credentials.complete)) {{
+                setTimeout(() => location.reload(), 2000);
+            }}
+        }})
+        .catch(() => {{}});
+}}
+setInterval(pollStatus, 3000);
+pollStatus();
+</script>
+</body>
+</html>'''
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Starting Polyconnect Bridge v1.1.8 on port %d", PORT)
-    if not TOKEN:
-        log.warning("No token configured — set it in the add-on options.")
-    if TOKEN:
+    log.info("Starting Polyconnect Bridge v2.0.0 on port %d", PORT)
+
+    if _capture_mgr.credentials.is_complete:
+        log.info("Credentials loaded — launching Playwright browser")
         try:
             ctrl._launch()
         except Exception as e:
             log.warning("Pre-launch failed: %s — will retry on first request", e)
+    else:
+        log.warning("Credentials incomplete — open the add-on UI to run capture")
+
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=False)
