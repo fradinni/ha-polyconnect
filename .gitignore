@@ -1,8 +1,10 @@
 # Runtime secrets — never commit
-scripts/captured_ids.json
-scripts/captured_token.txt
-scripts/captured_token.txt.info
-captured_token.txt
+**/captured_ids.json
+**/captured_token.txt
+**/captured_token.txt.info
+**/captured_dump.json
+**/.capture_status.json
+**/.env
 
 # Python
 __pycache__/
@@ -23,6 +25,13 @@ screenshot.png
 mitm_addon.py
 mitmproxy-ca-cert.pem
 *.pem
+
+# APK decompilation artifacts (keep source, exclude binaries)
+polyconnect_apk/
+*.xapk
+*.apk
+*.dll
+*.so
 
 # Editor / OS
 .DS_Store
