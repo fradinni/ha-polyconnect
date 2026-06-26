@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Polyconnect Bridge Server — HA Add-on v2.0.0
+"""Polyconnect Bridge Server — HA Add-on v2.0.1
 
 Features:
 - Persistent Chromium instance for controlling Polyconnect heat pumps
@@ -884,7 +884,7 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 <body>
 <div class="container">
     <h1>Polyconnect Bridge</h1>
-    <p class="subtitle">v2.0.0 — Pool heat pump control via Playwright</p>
+    <p class="subtitle">v2.0.1 — Pool heat pump control via Playwright</p>
 
     <!-- Credentials Status -->
     <div class="card">
@@ -1007,7 +1007,7 @@ pollStatus();
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Starting Polyconnect Bridge v2.0.0 on port %d", PORT)
+    log.info("Starting Polyconnect Bridge v2.0.1 on port %d", PORT)
     log.info("INGRESS_ENTRY=%r (base path for API calls)", INGRESS_ENTRY)
 
     if _capture_mgr.credentials.is_complete:
