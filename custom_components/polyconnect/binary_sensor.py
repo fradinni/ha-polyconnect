@@ -39,7 +39,7 @@ BINARY_SENSORS: tuple[PolyconnectBinarySensorDescription, ...] = (
     ),
     PolyconnectBinarySensorDescription(
         key="filtration_running",
-        data_key="heatPumpActive",
+        data_key="filtrationRunning",
         name="Filtration Pump",
         device_class=BinarySensorDeviceClass.RUNNING,
         icon="mdi:pump",
