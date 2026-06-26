@@ -15,9 +15,6 @@ RUN playwright install chromium --with-deps
 # Ensure /data directory exists (Supervisor maps it, but ensure it exists for local dev)
 RUN mkdir -p /data
 
-# Bust cache: changing this label forces Docker to rebuild subsequent layers
-LABEL io.hass.version="2.0.3"
-
 # Copy ALL addon source in a single layer (any file change invalidates this layer)
 COPY . /app/
 RUN cp /app/run.sh /run.sh && chmod +x /run.sh && \
