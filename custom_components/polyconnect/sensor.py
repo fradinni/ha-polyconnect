@@ -1,4 +1,4 @@
-"""Sensor platform for Polyconnect — temperature, power, mode, and status sensors."""
+"""Sensor platform for Polyconnect — temperature, mode, and status sensors."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,10 +10,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    UnitOfTemperature,
-    UnitOfPower,
-)
+from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -52,23 +49,6 @@ SENSORS: tuple[PolyconnectSensorDescription, ...] = (
         device_class=SensorDeviceClass.TEMPERATURE,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-    ),
-    # ── Power / efficiency sensors ───────────────────────────────────────────
-    PolyconnectSensorDescription(
-        key="power_consumption",
-        data_key="powerConsumptionW",
-        name="Power Consumption",
-        device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=UnitOfPower.WATT,
-    ),
-    PolyconnectSensorDescription(
-        key="cop",
-        data_key="cop",
-        name="Coefficient of Performance",
-        state_class=SensorStateClass.MEASUREMENT,
-        native_unit_of_measurement=None,
-        icon="mdi:heat-pump",
     ),
     # ── Mode / status sensors ────────────────────────────────────────────────
     PolyconnectSensorDescription(

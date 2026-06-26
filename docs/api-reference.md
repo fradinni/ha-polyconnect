@@ -55,8 +55,6 @@ Returns the current heat pump state by scraping the Blazor DOM.
   "filtrationRunning": false,
   "alarmActive": false,
   "alarmMessage": null,
-  "cop": 4.2,
-  "powerConsumptionW": 1050,
   "errorCode": 0
 }
 ```
@@ -73,8 +71,6 @@ Returns the current heat pump state by scraping the Blazor DOM.
 | `filtrationRunning` | bool | Whether the filtration pump is running |
 | `alarmActive` | bool | Whether an alarm condition exists |
 | `alarmMessage` | string\|null | Alarm text (French), null if no alarm |
-| `cop` | float\|null | Coefficient of Performance |
-| `powerConsumptionW` | float\|null | Current power draw in watts |
 | `errorCode` | int | 0 = no error, 1 = alarm active |
 
 **Error responses:**

@@ -231,17 +231,6 @@ _STATUS_JS = """
         }
     }
 
-    // COP / power
-    let cop = null, powerConsumptionW = null;
-    for (const row of document.querySelectorAll('.order-and-value-item, [class*="data-item"]')) {
-        const txt = row.textContent.toLowerCase();
-        const v = parseNum(row.textContent);
-        if (v === null) continue;
-        if (txt.includes('cop') || txt.includes('performance')) cop = v;
-        if ((txt.includes('watt') || txt.includes(' w ') || txt.includes('puissance') ||
-             txt.includes('power') || txt.includes('consomm')) && v > 50) powerConsumptionW = v;
-    }
-
     return {
         waterTemperature:    waterTemp,
         outsideTemperature:  outsideTemp,
@@ -253,8 +242,6 @@ _STATUS_JS = """
         filtrationRunning:   filtrationRunning,
         alarmActive:         alarmActive,
         alarmMessage:        alarmMessage,
-        cop:                 cop,
-        powerConsumptionW:   powerConsumptionW,
         errorCode:           alarmActive ? 1 : 0,
     };
 }
