@@ -17,8 +17,9 @@ playwright install chromium
 python server.py          # run bridge locally on :8765
 
 # Utility scripts (JWT capture, standalone bridge)
-python scripts/get-jwt.py
-python scripts/polyconnect-server.py
+python scripts/capture/get-jwt.py        # guided JWT capture wizard
+python scripts/capture/capture.py        # full MITM capture (JWT + device IDs)
+python scripts/bridge/polyconnect-server.py  # standalone bridge server
 ```
 
 There is **no test suite and no linter configured**. CI only runs `hassfest` and `hacs/action`.
@@ -44,7 +45,18 @@ ha-polyconnect/
 │   ├── requirements.txt             # flask, playwright
 │   └── run.sh
 ├── docs/                            # API reverse-engineering notes
-├── scripts/                         # Dev utilities (JWT capture)
+├── scripts/
+│   ├── capture/                     # MITM tools for extracting auth tokens & device IDs
+│   │   ├── capture.py               # full MITM capture wizard (JWT + device IDs)
+│   │   ├── get-jwt.py               # simpler JWT-only capture wizard
+│   │   ├── mitm_addon.py            # mitmproxy addon (used by capture.py at runtime)
+│   │   ├── mitmproxy-ca-cert.pem    # CA cert for MITM setup
+│   │   ├── captured_token.txt       # captured JWT (gitignored)
+│   │   ├── captured_ids.json        # captured installation/device IDs
+│   │   └── captured_dump.json       # full capture dump
+│   └── bridge/                      # Dev/test bridge server & app explorer
+│       ├── polyconnect-server.py    # standalone Flask+Playwright bridge server
+│       └── open-app.py              # opens Blazor app via Playwright (interactive / --capture-ids)
 ├── hacs.json
 └── repository.yaml
 ```
@@ -64,5 +76,5 @@ ha-polyconnect/
 - **Bridge (server.py):** Uses synchronous `threading.Lock` (not asyncio) because Playwright sync API requires it. `flask` runs with `threaded=False`. Long JS snippets stored as module-level string constants.
 
 ## Security Notes
-- Never commit `scripts/captured_token.txt` (gitignored). Tokens are short-lived JWTs.
+- Never commit `scripts/capture/captured_token.txt` (gitignored). Tokens are short-lived JWTs.
 - `docs/` contains embedded APK credentials from reverse engineering — do not redistribute.
