@@ -1,7 +1,7 @@
 name: "Polyconnect Bridge"
-version: "1.1.8"
+version: "2.0.0"
 slug: "polyconnect_bridge"
-description: "Playwright bridge server for Polyconnect / Ingeli pool heat pumps."
+description: "Playwright bridge + credential capture for Polyconnect / Ingeli pool heat pumps."
 url: "https://github.com/fradinni/ha-polyconnect"
 arch:
   - amd64
@@ -12,13 +12,17 @@ ingress: true
 ingress_port: 8765
 ports:
   8765/tcp: null
+  8080/tcp: 8080
+  8888/tcp: 8888
+ports_description:
+  8765/tcp: "Bridge API (HA ingress)"
+  8080/tcp: "Setup UI (phone access during capture)"
+  8888/tcp: "MITM proxy (phone traffic during capture)"
 options:
-  token: ""
-  heat_pump_id: "64140b25194618718c5083bd"
   log_level: "info"
 schema:
-  token: str
-  heat_pump_id: str
   log_level: "list(trace|debug|info|warning|error)"
 environment:
   PYTHONUNBUFFERED: "1"
+map:
+  - data:rw

@@ -5,7 +5,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from .api import PolyconnectAPI, PolyconnectError, AuthExpiredError
+from homeassistant.helpers import issue_registry as ir
+from .api import PolyconnectAPI, PolyconnectError, AuthExpiredError, CredentialsMissingError
 from .const import DOMAIN, LOGGER, CONF_BRIDGE_URL, DEFAULT_SCAN_INTERVAL
 
 
@@ -20,11 +21,38 @@ class PolyconnectCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict:
         try:
-            return await self.api.get_status()
+            data = await self.api.get_status()
+            # Clear any existing repair issue on successful fetch
+            ir.async_delete_issue(self.hass, DOMAIN, "auth_expired")
+            return data
         except AuthExpiredError as err:
+            # Create a repair issue so user can recapture
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                "auth_expired",
+                is_fixable=False,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="auth_expired",
+                translation_placeholders={},
+            )
             raise ConfigEntryAuthFailed(
-                "Polyconnect session token expired on bridge server. "
-                "Restart polyconnect-server.py with a fresh token."
+                "Polyconnect session token expired. "
+                "Open the Polyconnect Bridge add-on to recapture credentials."
+            ) from err
+        except CredentialsMissingError as err:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                "credentials_missing",
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="credentials_missing",
+                translation_placeholders={},
+            )
+            raise UpdateFailed(
+                "Polyconnect credentials not configured. "
+                "Open the Polyconnect Bridge add-on to run the capture wizard."
             ) from err
         except PolyconnectError as err:
             raise UpdateFailed(f"Error from Polyconnect bridge: {err}") from err
