@@ -835,13 +835,17 @@ def capture_reset():
 @app.route("/")
 def ingress_panel():
     """Serve the control panel visible through HA ingress."""
-    return Response(_build_ingress_html(), mimetype="text/html")
+    # HA sets X-Ingress-Path header (e.g. /api/hassio_ingress/<token>)
+    ingress_path = request.headers.get("X-Ingress-Path", "")
+    return Response(_build_ingress_html(ingress_path), mimetype="text/html")
 
 
-def _build_ingress_html() -> str:
+def _build_ingress_html(ingress_path: str = "") -> str:
     creds = _capture_mgr.credentials
     phase = _capture_mgr.status.phase.value
     local_ip = _capture_mgr.status.local_ip or "detecting..."
+    # Ensure base path ends with /
+    base_path = ingress_path.rstrip("/") + "/" if ingress_path else "./"
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -937,8 +941,8 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 </div>
 
 <script>
-// Resolve base path for HA ingress compatibility (relative to current page)
-const BASE = new URL('.', window.location.href).href;
+// Base path injected from X-Ingress-Path header for HA ingress compatibility
+const BASE = '{base_path}';
 
 function startCapture() {{
     fetch(BASE + 'capture/start', {{method: 'POST'}})
