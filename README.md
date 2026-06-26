@@ -3,9 +3,7 @@
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange?logo=homeassistantcommunitystore&logoColor=white)](https://github.com/fradinni/ha-polyconnect)
 [![HA 2024.1+](https://img.shields.io/badge/Home%20Assistant-2024.1+-blue?logo=homeassistant&logoColor=white)](https://www.home-assistant.io/)
 
-Control your **Polyconnect / Ingeli pool heat pump** from Home Assistant.
-
-Works with Polytropic, Warmeo, MytechConnect, Pentair, and other Ingeli-platform brands.
+Control your **Polytropic pool heat pump** from Home Assistant — for units connected and controlled via the **Polyconnect** app.
 
 ![Climate card preview](https://img.shields.io/badge/climate-heat%20%7C%20cool%20%7C%20auto-brightgreen) ![Presets](https://img.shields.io/badge/presets-Eco%20%7C%20Smart%20%7C%20Boost-blue) ![Temperature](https://img.shields.io/badge/range-8°C–32°C-yellow)
 
@@ -30,7 +28,7 @@ Works with Polytropic, Warmeo, MytechConnect, Pentair, and other Ingeli-platform
 ## Requirements
 
 - Home Assistant OS or Supervised (needed for the bridge add-on)
-- A working Polyconnect heat pump paired to the mobile app
+- A Polytropic heat pump paired to the Polyconnect mobile app
 - Phone on the same WiFi as Home Assistant (one-time setup)
 
 ---
