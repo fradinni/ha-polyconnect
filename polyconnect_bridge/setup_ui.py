@@ -285,7 +285,7 @@ header p {{ color: var(--text-dim); margin-top: 0.3rem; font-size: 0.85rem; }}
     <!-- Proxy config -->
     <div class="proxy-info">
         <div class="label">Configure your phone's WiFi proxy to:</div>
-        <div class="value">{local_ip}:{PROXY_PORT}</div>
+        <div class="value"><span id="proxy-host">{local_ip}</span>:{PROXY_PORT}</div>
     </div>
 
     <!-- Platform Tabs -->
@@ -327,7 +327,7 @@ header p {{ color: var(--text-dim); margin-top: 0.3rem; font-size: 0.85rem; }}
                     <h3>Set up the WiFi proxy</h3>
                     <p>Go to <strong>Settings &rarr; WiFi &rarr; tap (i) on your network</strong><br>
                     Scroll down &rarr; <strong>HTTP Proxy &rarr; Manual</strong></p>
-                    <div class="code-block">Server: {local_ip}<br>Port: {PROXY_PORT}<br>Authentication: Off</div>
+                    <div class="code-block">Server: <span class="proxy-host-val"></span><br>Port: {PROXY_PORT}<br>Authentication: Off</div>
                     <p>Tap <strong>Save</strong>.</p>
                 </div>
             </div>
@@ -365,7 +365,7 @@ header p {{ color: var(--text-dim); margin-top: 0.3rem; font-size: 0.85rem; }}
                 <div class="step-content">
                     <h3>Set up the WiFi proxy</h3>
                     <p><strong>Settings &rarr; WiFi &rarr; Long-press your network &rarr; Modify &rarr; Advanced</strong></p>
-                    <div class="code-block">Proxy: Manual<br>Hostname: {local_ip}<br>Port: {PROXY_PORT}<br>Bypass: (leave empty)</div>
+                    <div class="code-block">Proxy: Manual<br>Hostname: <span class="proxy-host-val"></span><br>Port: {PROXY_PORT}<br>Bypass: (leave empty)</div>
                     <p>Tap <strong>Save</strong>.</p>
                 </div>
             </div>
@@ -440,6 +440,12 @@ function updateStatus() {{
 
 setInterval(updateStatus, 2000);
 updateStatus();
+
+// Replace proxy host IP with the actual hostname the phone used to reach this page
+// (since port 8080 is mapped to the HA host, window.location.hostname is the correct IP)
+const proxyHost = window.location.hostname;
+document.getElementById('proxy-host').textContent = proxyHost;
+document.querySelectorAll('.proxy-host-val').forEach(el => el.textContent = proxyHost);
 </script>
 </body>
 </html>'''
