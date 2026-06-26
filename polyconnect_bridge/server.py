@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Polyconnect Bridge Server — HA Add-on v2.0.1
+"""Polyconnect Bridge Server — HA Add-on v2.0.2
 
 Features:
 - Persistent Chromium instance for controlling Polyconnect heat pumps
@@ -832,10 +832,6 @@ def capture_reset():
 
 # ── Ingress Control Panel (HTML at /) ─────────────────────────────────────────
 
-# The Supervisor injects INGRESS_ENTRY env var for ingress-enabled add-ons
-INGRESS_ENTRY = os.environ.get("INGRESS_ENTRY", "")
-
-
 @app.route("/")
 def ingress_panel():
     """Serve the control panel visible through HA ingress."""
@@ -846,8 +842,6 @@ def _build_ingress_html() -> str:
     creds = _capture_mgr.credentials
     phase = _capture_mgr.status.phase.value
     local_ip = _capture_mgr.status.local_ip or "detecting..."
-    # Build the absolute base path for API calls from the ingress entry
-    base_path = INGRESS_ENTRY.rstrip("/") + "/" if INGRESS_ENTRY else "/"
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -884,7 +878,7 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 <body>
 <div class="container">
     <h1>Polyconnect Bridge</h1>
-    <p class="subtitle">v2.0.1 — Pool heat pump control via Playwright</p>
+    <p class="subtitle">v2.0.2 — Pool heat pump control via Playwright</p>
 
     <!-- Credentials Status -->
     <div class="card">
@@ -943,9 +937,27 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 </div>
 
 <script>
-// Absolute base path for API calls (injected from INGRESS_ENTRY env var)
-const BASE = '{base_path}';
-console.log('[Polyconnect] API base path:', BASE);
+// Use document.baseURI which HA sets correctly for ingress panels,
+// or fall back to detecting from the iframe URL
+const BASE = (() => {{
+    // Check if we're in an iframe (HA ingress uses iframes)
+    try {{
+        if (window.location.pathname.includes('/api/hassio_ingress/')) {{
+            return window.location.pathname.replace(/\\/?$/, '/');
+        }}
+    }} catch(e) {{}}
+    // Try document.baseURI
+    try {{
+        const base = new URL(document.baseURI);
+        if (base.pathname.includes('/api/hassio_ingress/')) {{
+            return base.pathname.replace(/\\/?$/, '/');
+        }}
+    }} catch(e) {{}}
+    // Last resort: use root (works when accessed directly on port 8765)
+    return '/';
+}})();
+
+console.log('[Polyconnect] API base path:', BASE, 'location:', window.location.href);
 
 function startCapture() {{
     fetch(BASE + 'capture/start', {{method: 'POST'}})
@@ -1007,8 +1019,7 @@ pollStatus();
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Starting Polyconnect Bridge v2.0.1 on port %d", PORT)
-    log.info("INGRESS_ENTRY=%r (base path for API calls)", INGRESS_ENTRY)
+    log.info("Starting Polyconnect Bridge v2.0.2 on port %d", PORT)
 
     if _capture_mgr.credentials.is_complete:
         log.info("Credentials loaded — launching Playwright browser")
