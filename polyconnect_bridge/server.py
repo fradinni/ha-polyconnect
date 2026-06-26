@@ -730,7 +730,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "polyconnect-bridge",
-        "version": "2.0.0",
+        "version": "1.0.0",
         "credentials_configured": creds.is_complete,
         "capture_phase": _capture_mgr.status.phase.value,
     })
