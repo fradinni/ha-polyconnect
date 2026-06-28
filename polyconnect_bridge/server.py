@@ -353,7 +353,18 @@ class PolyconnectController:
         with self._lock:
             self._ensure()
             self._ensure_view()
-            time.sleep(1.5)
+            heat_pump = _get_heat_pump_id()
+            self._page.evaluate(
+                f"Blazor._internal.navigationManager.navigateTo("
+                f"'{BASE}/heat-pump-view/{heat_pump}', false)")
+            try:
+                self._page.wait_for_selector(
+                    ".co-gauge-container, .heat-pump-view-mode-container, "
+                    ".order-and-value-item",
+                    timeout=8_000)
+            except Exception:
+                pass
+            time.sleep(2.5)
             return self._page.evaluate(_STATUS_JS)
 
     # ── set_mode ──────────────────────────────────────────────────────────────
@@ -717,7 +728,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "polyconnect-bridge",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "credentials_configured": creds.is_complete,
         "capture_phase": _capture_mgr.status.phase.value,
     })
