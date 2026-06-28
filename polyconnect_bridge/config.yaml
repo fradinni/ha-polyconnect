@@ -1,5 +1,5 @@
 name: "Polyconnect Bridge"
-version: "1.0.0"
+version: "1.0.1"
 slug: "polyconnect_bridge"
 description: "Playwright bridge + credential capture for Polyconnect / Ingeli pool heat pumps."
 url: "https://github.com/fradinni/ha-polyconnect"
