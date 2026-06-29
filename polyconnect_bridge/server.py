@@ -34,12 +34,7 @@ def _get_heat_pump_id() -> str:
     return _capture_mgr.credentials.heat_pump_id or ""
 
 def _get_installation_id() -> str:
-    inst = _capture_mgr.credentials.installation_id or ""
-    if not inst and _get_heat_pump_id():
-        # Fallback: derive from heat_pump_id (often differs by last char)
-        hp = _get_heat_pump_id()
-        inst = hp[:-1] + chr(ord(hp[-1]) + 1)
-    return inst
+    return _capture_mgr.credentials.installation_id or ""
 
 
 LOG_LEVEL = os.environ.get("POLYCONNECT_LOG_LEVEL", "info").upper()

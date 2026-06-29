@@ -10,11 +10,34 @@ Two components: the HA integration (`custom_components/polyconnect/`) and a Flas
 # Validate HA integration metadata (requires Docker / act or a push to CI)
 # CI runs hassfest and HACS validation — no local equivalents are configured
 
-# Bridge add-on (local dev)
-cd polyconnect_bridge
-pip install -r requirements.txt
+# Bridge add-on (local dev) — one-liner using captured credentials
+./scripts/run-local-bridge-server.sh     # starts bridge on :8765, Ctrl-C to stop
+
+# Prerequisites (first time only)
+pip install -r polyconnect_bridge/requirements.txt
 playwright install chromium
-python server.py          # run bridge locally on :8765
+
+# Manual alternative (without the wrapper script)
+cd polyconnect_bridge
+POLYCONNECT_DATA_DIR=/tmp/polyconnect_data python server.py
+# (copy scripts/capture/captured_token.txt → /tmp/polyconnect_data/token.txt
+#  and scripts/capture/captured_ids.json  → /tmp/polyconnect_data/ids.json first)
+
+# Quick smoke tests — IMPORTANT: run server + tests in ONE shell session.
+# Separate shell calls kill the background process between invocations.
+# Pattern:
+./scripts/run-local-bridge-server.sh > /tmp/bridge_server.log 2>&1 &
+SERVER_PID=$!
+for i in $(seq 1 10); do sleep 1; curl -s http://localhost:8765/status > /dev/null && break; done
+curl -s http://localhost:8765/status | python3 -m json.tool
+curl -X POST http://localhost:8765/mode -H 'Content-Type: application/json' -d '{"mode":"Eco"}'
+curl -X POST http://localhost:8765/setpoint -H 'Content-Type: application/json' -d '{"temperature":28}'
+fuser -k 8765/tcp 2>/dev/null; wait 2>/dev/null; true
+
+# Notes:
+# - The wrapper script resolves paths from its own location, works from any CWD.
+# - POLYCONNECT_DATA_DIR overrides the default /data (needed outside the add-on container).
+# - Credentials in scripts/capture/ are gitignored; re-run capture.py if expired.
 
 # Utility scripts (JWT capture, standalone bridge)
 python scripts/capture/get-jwt.py        # guided JWT capture wizard
@@ -46,6 +69,7 @@ ha-polyconnect/
 │   └── run.sh
 ├── docs/                            # API reverse-engineering notes
 ├── scripts/
+│   ├── run-local-bridge-server.sh       # start bridge locally with captured credentials
 │   ├── capture/                     # MITM tools for extracting auth tokens & device IDs
 │   │   ├── capture.py               # full MITM capture wizard (JWT + device IDs)
 │   │   ├── get-jwt.py               # simpler JWT-only capture wizard
