@@ -19,7 +19,7 @@ from pathlib import Path
 
 from capture_manager import CaptureManager, DATA_DIR
 
-BRIDGE_VERSION = "1.0.3"
+BRIDGE_VERSION = "1.0.4"
 
 # ── Credential loading (from /data/ persistent storage) ───────────────────────
 
