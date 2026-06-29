@@ -13,7 +13,7 @@ Ports:
 """
 from __future__ import annotations
 
-import math, os, logging, threading, time, json, sys
+import math, os, logging, queue, threading, time, json, sys
 from flask import Flask, jsonify, request, Response
 from pathlib import Path
 
@@ -249,12 +249,46 @@ _STATUS_JS = """
 }
 """
 
+# ── Dedicated Playwright thread ────────────────────────────────────────────────
+
+class PlaywrightThread:
+    """All Playwright calls must run on the same OS thread that created the
+    sync_playwright instance.  This class owns that thread and accepts
+    callables via a queue, returning results to the caller."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._worker, daemon=True, name="playwright")
+        self._thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            fn, args, kwargs, result_box, event = self._queue.get()
+            try:
+                result_box["value"] = fn(*args, **kwargs)
+            except BaseException as exc:
+                result_box["error"] = exc
+            finally:
+                event.set()
+
+    def call(self, fn, *args, **kwargs):
+        result_box: dict = {}
+        event = threading.Event()
+        self._queue.put((fn, args, kwargs, result_box, event))
+        event.wait()
+        if "error" in result_box:
+            raise result_box["error"]
+        return result_box.get("value")
+
+
 # ── Persistent browser controller ─────────────────────────────────────────────
 
 class PolyconnectController:
     """Single persistent Chromium instance, serialised by a threading lock."""
 
     def __init__(self):
+        self._pw_thread = PlaywrightThread()
         self._lock   = threading.Lock()
         self._pw     = None
         self._browser= None
@@ -798,7 +832,7 @@ def health():
 
 @app.route("/status")
 def get_status():
-    data, code = _safe(ctrl.get_status)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.get_status)
     return jsonify(data), code
 
 
@@ -849,7 +883,7 @@ def debug_dom():
                 return results;
             }""")
             return {"url": ctrl._page.url, "body_text": body_text[:2000], "elements": elements}
-    data, code = _safe(_dump)
+    data, code = _safe(ctrl._pw_thread.call, _dump)
     return jsonify(data), code
 
 
@@ -858,7 +892,7 @@ def setpoint():
     temp = (request.get_json(silent=True) or {}).get("temperature")
     if temp is None:
         return jsonify({"error": "missing temperature"}), 400
-    data, code = _safe(ctrl.set_setpoint, float(temp))
+    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, float(temp))
     return jsonify(data), code
 
 
@@ -868,31 +902,31 @@ def mode():
     m = (request.get_json(silent=True) or {}).get("mode", "")
     if not m:
         return jsonify({"error": "missing mode"}), 400
-    data, code = _safe(ctrl.set_mode, m)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m)
     return jsonify(data), code
 
 
 @app.route("/on", methods=["POST"])
 def turn_on():
-    data, code = _safe(ctrl.turn_on)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_on)
     return jsonify(data), code
 
 
 @app.route("/off", methods=["POST"])
 def turn_off():
-    data, code = _safe(ctrl.turn_off)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_off)
     return jsonify(data), code
 
 
 @app.route("/filtration/start", methods=["POST"])
 def filtration_start():
-    data, code = _safe(ctrl.start_filtration)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.start_filtration)
     return jsonify(data), code
 
 
 @app.route("/filtration/stop", methods=["POST"])
 def filtration_stop():
-    data, code = _safe(ctrl.stop_filtration)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.stop_filtration)
     return jsonify(data), code
 
 
@@ -1163,7 +1197,7 @@ if __name__ == "__main__":
     if _capture_mgr.credentials.is_complete:
         log.info("Credentials loaded — launching Playwright browser")
         try:
-            ctrl._launch()
+            ctrl._pw_thread.call(ctrl._launch)
         except Exception as e:
             log.warning("Pre-launch failed: %s — will retry on first request", e)
     else:
