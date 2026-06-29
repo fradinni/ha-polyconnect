@@ -75,6 +75,9 @@ ha-polyconnect/
 - **Section dividers:** Use `# ── Title ──────` style comments for logical grouping in longer files.
 - **Bridge (server.py):** Uses synchronous `threading.Lock` (not asyncio) because Playwright sync API requires it. `flask` runs with `threaded=False`. Long JS snippets stored as module-level string constants.
 
+## Domain Notes
+- `waterTemperature` is `null` when the circulation pump is not running. This is expected behavior, not a scraping bug.
+
 ## Security Notes
 - Never commit `scripts/capture/captured_token.txt` (gitignored). Tokens are short-lived JWTs.
 - `docs/` contains embedded APK credentials from reverse engineering — do not redistribute.
