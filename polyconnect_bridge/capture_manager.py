@@ -322,9 +322,13 @@ class CaptureManager:
         while not self._stop_event.is_set():
             time.sleep(1.0)
 
+            # Snapshot _proc under lock to avoid TOCTOU with stop_capture()
+            with self._lock:
+                proc = self._proc
+
             # Check if mitmproxy crashed
-            if self._proc and self._proc.poll() is not None:
-                log.warning("mitmproxy exited unexpectedly (code=%s)", self._proc.returncode)
+            if proc and proc.poll() is not None:
+                log.warning("mitmproxy exited unexpectedly (code=%s)", proc.returncode)
                 with self._lock:
                     self.status.phase = CapturePhase.IDLE
                     self.status.error = "mitmproxy crashed"
@@ -348,7 +352,8 @@ class CaptureManager:
             if self.status.all_captured:
                 if complete_time is None:
                     complete_time = time.time()
-                    self.status.phase = CapturePhase.COMPLETE
+                    with self._lock:
+                        self.status.phase = CapturePhase.COMPLETE
                     self._save_credentials()
                     log.info("All credentials captured! Auto-stopping in %ds", AUTO_STOP_GRACE_SECONDS)
                 elif time.time() - complete_time > AUTO_STOP_GRACE_SECONDS:
@@ -357,7 +362,7 @@ class CaptureManager:
                     break
 
             # Read mitmdump output for request counting
-            if self._proc and self._proc.stdout:
+            if proc and proc.stdout:
                 self._drain_stdout()
 
     def _sync_from_status(self, data: dict) -> None:
