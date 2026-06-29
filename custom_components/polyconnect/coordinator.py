@@ -16,13 +16,18 @@ class PolyconnectCoordinator(DataUpdateCoordinator):
         scan_interval = entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL)
         super().__init__(
             hass, LOGGER, name=DOMAIN,
-            update_interval=timedelta(seconds=scan_interval),
+            update_interval=timedelta(minutes=scan_interval),
         )
 
     async def _async_update_data(self) -> dict:
         try:
             data = await self.api.get_status()
-            # Clear any existing repair issue on successful fetch
+            null_fields = sum(1 for v in data.values() if v is None)
+            if null_fields >= 6:
+                raise UpdateFailed(
+                    f"Bridge returned {null_fields}/11 null fields — "
+                    "DOM likely not rendered (possible token expiry)"
+                )
             ir.async_delete_issue(self.hass, DOMAIN, "auth_expired")
             return data
         except AuthExpiredError as err:

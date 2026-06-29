@@ -10,7 +10,7 @@ PLATFORMS = ["sensor", "climate", "binary_sensor", "switch"]
 CONF_BRIDGE_URL = "bridge_url"
 CONF_SCAN_INTERVAL = "scan_interval"
 
-DEFAULT_SCAN_INTERVAL = 60  # seconds
+DEFAULT_SCAN_INTERVAL = 1  # minute
 
 # ── Operating mode mappings ───────────────────────────────────────────────────
 # Polyconnect app name → HA HVACMode value
