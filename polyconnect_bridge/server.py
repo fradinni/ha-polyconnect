@@ -1203,4 +1203,5 @@ if __name__ == "__main__":
     else:
         log.warning("Credentials incomplete — open the add-on UI to run capture")
 
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=PORT, threads=8)
