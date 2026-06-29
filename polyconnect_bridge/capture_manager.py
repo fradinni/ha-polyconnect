@@ -28,7 +28,7 @@ log = logging.getLogger("polyconnect.capture")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path("/data")
+DATA_DIR = Path(os.environ.get("POLYCONNECT_DATA_DIR", "/data"))
 TOKEN_FILE = DATA_DIR / "token.txt"
 IDS_FILE = DATA_DIR / "ids.json"
 CAPTURE_STATUS_FILE = DATA_DIR / ".capture_status.json"
