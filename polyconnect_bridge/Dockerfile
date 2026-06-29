@@ -22,6 +22,7 @@ RUN cp /app/run.sh /run.sh && chmod +x /run.sh && \
     cp /app/capture_manager.py /capture_manager.py && \
     cp /app/mitm_addon.py /mitm_addon.py && \
     cp /app/setup_ui.py /setup_ui.py && \
+    cp /app/config.yaml /config.yaml && \
     rm -rf /app/
 
 ENV PYTHONUNBUFFERED=1
