@@ -892,7 +892,11 @@ def setpoint():
     temp = (request.get_json(silent=True) or {}).get("temperature")
     if temp is None:
         return jsonify({"error": "missing temperature"}), 400
-    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, float(temp))
+    try:
+        temp_f = float(temp)
+    except (TypeError, ValueError):
+        return jsonify({"error": "temperature must be a number"}), 400
+    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f)
     return jsonify(data), code
 
 
@@ -902,6 +906,8 @@ def mode():
     m = (request.get_json(silent=True) or {}).get("mode", "")
     if not m:
         return jsonify({"error": "missing mode"}), 400
+    if m not in (MAIN_MODES | REG_MODES):
+        return jsonify({"error": f"invalid mode: {m}"}), 400
     data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m)
     return jsonify(data), code
 
