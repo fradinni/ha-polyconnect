@@ -103,7 +103,7 @@ bump_bridge() {
     fi
 
     sed -i "s/^version: \"[^\"]*\"/version: \"$new_ver\"/" "$ADDON_CONFIG"
-    sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$new_ver\"/" "$SERVER_PY"
+    sed -i "s/^BRIDGE_VERSION = \"[^\"]*\"/BRIDGE_VERSION = \"$new_ver\"/" "$SERVER_PY"
     echo "  ✓ bridge: $current → $new_ver  ($ADDON_CONFIG, $SERVER_PY)"
 }
 
