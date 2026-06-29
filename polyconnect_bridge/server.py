@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Polyconnect Bridge Server — HA Add-on v2.0.3
+"""Polyconnect Bridge Server — HA Add-on
 
 Features:
 - Persistent Chromium instance for controlling Polyconnect heat pumps
@@ -18,6 +18,8 @@ from flask import Flask, jsonify, request, Response
 from pathlib import Path
 
 from capture_manager import CaptureManager, DATA_DIR
+
+BRIDGE_VERSION = "1.0.1"
 
 # ── Credential loading (from /data/ persistent storage) ───────────────────────
 
@@ -293,6 +295,12 @@ class PolyconnectController:
                 timeout=20_000)
         except Exception:
             pass
+        try:
+            page.wait_for_function(
+                "() => document.body.innerText.trim().length > 10",
+                timeout=8_000)
+        except Exception:
+            pass
         body = page.evaluate("() => document.body.innerText.substring(0, 200)")
         if "403" in body or "must be connected" in body.lower():
             raise RuntimeError("Session token expired — recapture needed")
@@ -306,7 +314,11 @@ class PolyconnectController:
                 timeout=12_000)
         except Exception:
             pass
-        time.sleep(3.0)
+        wait_ms = self._wait_for_data(timeout_ms=10_000)
+        log.debug("App loaded — data ready after %.0fms", wait_ms)
+        body = page.evaluate("() => document.body.innerText.substring(0, 200)")
+        if "403" in body or "must be connected" in body.lower():
+            raise RuntimeError("Session token expired — recapture needed")
         log.info("Browser launched and heat pump view loaded")
 
     def _ensure(self):
@@ -349,11 +361,38 @@ class PolyconnectController:
 
     # ── get_status ────────────────────────────────────────────────────────────
 
+    _DATA_READY_JS = """() => {
+        const setpoint = document.querySelector('.order-and-value-order-number');
+        const weather  = document.querySelector('.topbar-weather');
+        const gauge    = document.querySelector('.co-gauge-container');
+        if (!gauge) return false;
+        if (setpoint && setpoint.textContent.trim()) return true;
+        if (weather && weather.textContent.trim()) return true;
+        return false;
+    }"""
+
+    def _wait_for_data(self, timeout_ms: int = 8_000) -> float:
+        t0 = time.time()
+        try:
+            self._page.wait_for_function(self._DATA_READY_JS, timeout=timeout_ms)
+        except Exception:
+            pass
+        return (time.time() - t0) * 1000
+
     def get_status(self) -> dict:
         with self._lock:
             self._ensure()
             self._ensure_view()
             heat_pump = _get_heat_pump_id()
+            installation_id = _get_installation_id()
+            self._page.evaluate(
+                f"Blazor._internal.navigationManager.navigateTo("
+                f"'{BASE}/installation-overview/{installation_id}', false)")
+            try:
+                self._page.wait_for_selector(
+                    ".device-summary-item", timeout=5_000)
+            except Exception:
+                time.sleep(0.5)
             self._page.evaluate(
                 f"Blazor._internal.navigationManager.navigateTo("
                 f"'{BASE}/heat-pump-view/{heat_pump}', false)")
@@ -364,8 +403,31 @@ class PolyconnectController:
                     timeout=8_000)
             except Exception:
                 pass
-            time.sleep(2.5)
-            return self._page.evaluate(_STATUS_JS)
+            wait_ms = self._wait_for_data(timeout_ms=6_000)
+            log.debug("Data ready after %.0fms", wait_ms)
+            snippet = self._page.evaluate(
+                "() => document.body.innerText.substring(0, 200)")
+            if "403" in snippet or "must be connected" in snippet.lower():
+                log.warning("Token expired detected during get_status — closing browser")
+                try:
+                    self._browser.close()
+                    self._pw.stop()
+                except Exception:
+                    pass
+                self._browser = None
+                self._pw      = None
+                self._page    = None
+                raise RuntimeError("Session token expired — recapture needed")
+            data = self._page.evaluate(_STATUS_JS)
+            null_count = sum(1 for v in data.values() if v is None)
+            if null_count >= 6:
+                log.warning(
+                    "get_status returned %d/11 null fields — DOM may not have rendered. "
+                    "Page text: %s",
+                    null_count,
+                    self._page.evaluate("() => document.body.innerText.substring(0, 300)")[:200],
+                )
+            return data
 
     # ── set_mode ──────────────────────────────────────────────────────────────
 
@@ -728,7 +790,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "polyconnect-bridge",
-        "version": "1.0.1",
+        "version": BRIDGE_VERSION,
         "credentials_configured": creds.is_complete,
         "capture_phase": _capture_mgr.status.phase.value,
     })
@@ -737,6 +799,57 @@ def health():
 @app.route("/status")
 def get_status():
     data, code = _safe(ctrl.get_status)
+    return jsonify(data), code
+
+
+@app.route("/debug/dom")
+def debug_dom():
+    """Dump DOM content for debugging selectors."""
+    def _dump():
+        with ctrl._lock:
+            ctrl._ensure()
+            ctrl._ensure_view()
+            heat_pump = _get_heat_pump_id()
+            ctrl._page.evaluate(
+                f"Blazor._internal.navigationManager.navigateTo("
+                f"'{BASE}/heat-pump-view/{heat_pump}', false)")
+            try:
+                ctrl._page.wait_for_selector(
+                    ".co-gauge-container, .heat-pump-view-mode-container, "
+                    ".order-and-value-item",
+                    timeout=8_000)
+            except Exception:
+                pass
+            time.sleep(2.5)
+            body_text = ctrl._page.evaluate("() => document.body.innerText")
+            elements = ctrl._page.evaluate("""() => {
+                const results = [];
+                const selectors = [
+                    '.order-and-value-value-number', '.order-and-value-order-number',
+                    '.order-and-value-item', '.state-button-value',
+                    '.heat-pump-view-temperature-value', '.device-summary-temperature',
+                    '[class*="value-number"]', '[class*="water-temp"]', '[class*="waterTemp"]',
+                    '[class*="setpoint"]', '.round-slider-value',
+                    '.co-gauge-container', '.heat-pump-view-mode-container',
+                    '.heat-pump-on-off button', '.co-on-off-button',
+                    '[class*="compressor"]', '[class*="filtration"]',
+                    '.topbar-weather', '[class*="alarm"]', '[class*="error"]',
+                ];
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        results.push({
+                            selector: sel,
+                            text: el.textContent.trim().substring(0, 100),
+                            classes: el.className.substring(0, 200),
+                            visible: el.offsetParent !== null,
+                        });
+                    }
+                }
+                return results;
+            }""")
+            return {"url": ctrl._page.url, "body_text": body_text[:2000], "elements": elements}
+    data, code = _safe(_dump)
     return jsonify(data), code
 
 
@@ -881,7 +994,7 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 <body>
 <div class="container">
     <h1>Polyconnect Bridge</h1>
-    <p class="subtitle">v2.0.3 — Pool heat pump control via Playwright</p>
+    <p class="subtitle">v{BRIDGE_VERSION} — Pool heat pump control via Playwright</p>
 
     <!-- Credentials Status -->
     <div class="card">
@@ -1045,7 +1158,7 @@ pollStatus();
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Starting Polyconnect Bridge v2.0.3 on port %d", PORT)
+    log.info("Starting Polyconnect Bridge v%s on port %d", BRIDGE_VERSION, PORT)
 
     if _capture_mgr.credentials.is_complete:
         log.info("Credentials loaded — launching Playwright browser")
@@ -1056,4 +1169,4 @@ if __name__ == "__main__":
     else:
         log.warning("Credentials incomplete — open the add-on UI to run capture")
 
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

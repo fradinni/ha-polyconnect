@@ -12,7 +12,9 @@ get_option() {
 
 export POLYCONNECT_LOG_LEVEL=$(get_option log_level)
 
-echo "Starting Polyconnect Bridge v2.0.0..."
+ADDON_DIR="$(cd "$(dirname "$0")" && pwd)"
+BRIDGE_VERSION=$(grep -oP '(?<=^version: ")[^"]+' "$ADDON_DIR/config.yaml" 2>/dev/null || echo "unknown")
+echo "Starting Polyconnect Bridge v${BRIDGE_VERSION}..."
 echo "  Credentials stored in: /data/"
 echo "  Log level: ${POLYCONNECT_LOG_LEVEL:-info}"
 
