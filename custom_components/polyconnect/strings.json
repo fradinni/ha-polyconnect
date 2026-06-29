@@ -6,7 +6,7 @@
         "description": "Enter the URL of the Polyconnect bridge server.\n\n**Recommended:** Install the **Polyconnect Bridge** add-on from this repository, then use its ingress URL (auto-detected below).\n\nMake sure you have run the **credential capture** from the add-on's UI before completing setup.",
         "data": {
           "bridge_url": "Bridge Server URL",
-          "scan_interval": "Scan Interval (seconds)"
+          "scan_interval": "Scan Interval (minutes)"
         },
         "data_description": {
           "bridge_url": "URL of the Polyconnect bridge (auto-detected if add-on is running)",
@@ -28,7 +28,7 @@
       "init": {
         "title": "Polyconnect Options",
         "data": {
-          "scan_interval": "Scan Interval (seconds)"
+          "scan_interval": "Scan Interval (minutes)"
         }
       }
     }

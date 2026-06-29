@@ -112,7 +112,7 @@ class PolyconnectConfigFlow(ConfigFlow, domain=DOMAIN):
                     TextSelectorConfig(type=TextSelectorType.URL)
                 ),
                 vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): NumberSelector(
-                    NumberSelectorConfig(min=10, max=3600, step=10, mode="box")
+                    NumberSelectorConfig(min=1, max=60, step=1, mode="box", unit_of_measurement="min")
                 ),
             }),
             errors=errors,
@@ -137,7 +137,7 @@ class PolyconnectOptionsFlow(OptionsFlow):
                     CONF_SCAN_INTERVAL,
                     default=current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
                 ): NumberSelector(
-                    NumberSelectorConfig(min=10, max=3600, step=10, mode="box")
+                    NumberSelectorConfig(min=1, max=60, step=1, mode="box", unit_of_measurement="min")
                 ),
             }),
         )
