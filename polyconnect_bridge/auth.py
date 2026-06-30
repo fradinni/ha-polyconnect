@@ -244,21 +244,31 @@ class AuthError(Exception):
     """Raised when the auth API returns a non-success state."""
 
 
-# ── Credentials snapshot (parity with v1) ─────────────────────────────────────
+# ── Credentials snapshot (multi-pump aware) ───────────────────────────────────
 @dataclass
 class Credentials:
     token: str | None = None
     installation_id: str | None = None
-    heat_pump_id: str | None = None
+    # Each pump = {"id": "<24-char hex>", "name": "<display name>"}.
+    # The list shape supports multi-pump installations; index 0 is the "default"
+    # pump (what legacy /status, /setpoint, ... aliases target).
+    heat_pumps: list[dict] = field(default_factory=list)
+
+    @property
+    def heat_pump_id(self) -> str | None:
+        """Back-compat: first pump's id, or None."""
+        return self.heat_pumps[0]["id"] if self.heat_pumps else None
 
     @property
     def is_complete(self) -> bool:
-        return bool(self.token and self.installation_id and self.heat_pump_id)
+        return bool(self.token and self.installation_id and self.heat_pumps)
 
     def to_dict(self) -> dict:
         return {
             "token": self.token,
             "installation_id": self.installation_id,
+            "heat_pumps": list(self.heat_pumps),
+            # Back-compat aliases for older clients
             "heat_pump_id": self.heat_pump_id,
             "complete": self.is_complete,
         }
@@ -325,7 +335,20 @@ class AuthManager:
             try:
                 d = json.loads(IDS_FILE.read_text())
                 self.credentials.installation_id = d.get("installation_id") or None
-                self.credentials.heat_pump_id = d.get("heat_pump_id") or None
+                # Two on-disk shapes are supported:
+                #   v2.0:  {"installation_id": "...", "heat_pump_id": "<one>"}
+                #   v2.1+: {"installation_id": "...", "heat_pumps": [{"id","name"}, ...]}
+                if "heat_pumps" in d and isinstance(d["heat_pumps"], list):
+                    self.credentials.heat_pumps = [
+                        {"id": p["id"], "name": p.get("name") or f"Heat pump {i+1}"}
+                        for i, p in enumerate(d["heat_pumps"]) if p.get("id")
+                    ]
+                elif d.get("heat_pump_id"):
+                    # Migrate single-pump shape -> single-entry list
+                    self.credentials.heat_pumps = [
+                        {"id": d["heat_pump_id"], "name": "Heat pump"}
+                    ]
+                    log.info("Migrated single-pump ids.json -> multi-pump list shape")
             except Exception as e:
                 log.warning("Failed to load IDs: %s", e)
 
@@ -333,7 +356,10 @@ class AuthManager:
         if self._cfg_installation:
             self.credentials.installation_id = self._cfg_installation
         if self._cfg_heat_pump:
-            self.credentials.heat_pump_id = self._cfg_heat_pump
+            # User-pinned single pump via env -> replace the list with a single entry.
+            self.credentials.heat_pumps = [
+                {"id": self._cfg_heat_pump, "name": "Heat pump"}
+            ]
 
         # v1 → v2 migration: a leftover token.txt from mitm capture stays usable
         # until the session is refreshed. We do NOT delete it — refresh writes
@@ -361,7 +387,7 @@ class AuthManager:
     def _save_ids(self) -> None:
         IDS_FILE.write_text(json.dumps({
             "installation_id": self.credentials.installation_id,
-            "heat_pump_id": self.credentials.heat_pump_id,
+            "heat_pumps": list(self.credentials.heat_pumps),
         }, indent=2) + "\n")
 
     # ── core flow ─────────────────────────────────────────────────────────────
@@ -409,14 +435,19 @@ class AuthManager:
     def set_credentials(self, email: str, password: str,
                         installation_id: str | None = None,
                         heat_pump_id: str | None = None) -> dict:
-        """Update credentials at runtime (e.g. from the bridge UI) and re-login."""
+        """Update credentials at runtime (e.g. from the bridge UI) and re-login.
+        Passing a single `heat_pump_id` pins the list to that one pump (single-pump
+        mode); pass None to leave the discovered list untouched."""
         with self._lock:
             self._email = (email or "").strip()
             self._password = (password or "").strip()
             if installation_id is not None:
                 self.credentials.installation_id = installation_id.strip() or None
             if heat_pump_id is not None:
-                self.credentials.heat_pump_id = heat_pump_id.strip() or None
+                pinned = heat_pump_id.strip()
+                self.credentials.heat_pumps = (
+                    [{"id": pinned, "name": "Heat pump"}] if pinned else []
+                )
             self._save_ids()
             try:
                 self._ensure_session()
@@ -425,22 +456,36 @@ class AuthManager:
                 self._last_error = str(e)
                 return {"ok": False, "error": str(e)}
 
-    def set_ids(self, installation_id: str | None = None,
-                heat_pump_id: str | None = None) -> None:
-        """Persist discovered IDs without touching email/password/session.
-        Used by the Playwright-side auto-discovery."""
+    def set_pumps(self, installation_id: str | None,
+                  heat_pumps: list[dict]) -> None:
+        """Persist discovered pump list without touching session/credentials.
+        `heat_pumps` items must be dicts with at least an `id` key; `name`
+        defaults to 'Heat pump <N>' if absent. Used by Playwright auto-discovery."""
         with self._lock:
+            normalized: list[dict] = []
+            for i, p in enumerate(heat_pumps or []):
+                pid = (p or {}).get("id")
+                if not pid:
+                    continue
+                normalized.append({
+                    "id": pid,
+                    "name": (p.get("name") or f"Heat pump {i+1}").strip() or f"Heat pump {i+1}",
+                })
             changed = False
             if installation_id and installation_id != self.credentials.installation_id:
                 self.credentials.installation_id = installation_id
                 changed = True
-            if heat_pump_id and heat_pump_id != self.credentials.heat_pump_id:
-                self.credentials.heat_pump_id = heat_pump_id
+            # Compare by (id, name) tuples — preserve order.
+            old = [(p["id"], p["name"]) for p in self.credentials.heat_pumps]
+            new = [(p["id"], p["name"]) for p in normalized]
+            if old != new:
+                self.credentials.heat_pumps = normalized
                 changed = True
             if changed:
                 self._save_ids()
-                log.info("Persisted discovered IDs: installation=%s heat_pump=%s",
-                         self.credentials.installation_id, self.credentials.heat_pump_id)
+                log.info("Persisted %d pump(s): installation=%s pumps=%s",
+                         len(normalized), self.credentials.installation_id,
+                         [(p["id"], p["name"]) for p in normalized])
 
     def reset_credentials(self) -> None:
         """Clear ALL persisted state. Forces a fresh terminal registration next time."""
