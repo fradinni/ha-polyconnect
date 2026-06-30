@@ -1,12 +1,6 @@
 """Switch platform for Polyconnect — heat pump power on/off.
 
-In the Polyconnect app the main power button (ON/OFF) controls whether the
-heat pump is active. This switch maps directly to that button via the
-bridge /on and /off endpoints.
-
-The climate entity also exposes TURN_ON / TURN_OFF for the same button;
-having a dedicated switch makes it easy to toggle power from dashboards
-and automations without going through the climate card.
+One switch per discovered heat pump.
 """
 from __future__ import annotations
 
@@ -25,31 +19,40 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: PolyconnectCoordinator = entry.runtime_data
-    async_add_entities([PolyconnectPowerSwitch(coordinator)])
+    async_add_entities(
+        PolyconnectPowerSwitch(coordinator, pump["id"], pump["name"])
+        for pump in coordinator.pumps
+    )
 
 
 class PolyconnectPowerSwitch(PolyconnectEntity, SwitchEntity):
-    """Switch that turns the heat pump on or off (the main power button)."""
+    """Switch that turns this pump on or off (the main power button)."""
 
     _attr_name = "Power"
     _attr_icon = "mdi:power"
 
-    def __init__(self, coordinator: PolyconnectCoordinator) -> None:
-        super().__init__(coordinator, "power_switch")
+    def __init__(
+        self,
+        coordinator: PolyconnectCoordinator,
+        pump_id: str,
+        pump_name: str,
+    ) -> None:
+        super().__init__(coordinator, pump_id, pump_name, "power_switch")
 
     @property
     def is_on(self) -> bool | None:
-        if not self.coordinator.data:
+        data = self._pump_data
+        if not data:
             return None
-        val = self.coordinator.data.get("heatPumpActive")
+        val = data.get("heatPumpActive")
         if val is None:
             return None
         return bool(val)
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self.coordinator.api.turn_on()
+        await self.coordinator.api.turn_on(self._pump_id)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self.coordinator.api.turn_off()
+        await self.coordinator.api.turn_off(self._pump_id)
         await self.coordinator.async_request_refresh()

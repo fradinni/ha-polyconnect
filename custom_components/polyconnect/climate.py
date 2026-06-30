@@ -1,22 +1,12 @@
-"""Climate platform for Polyconnect — heat pump thermostat.
+"""Climate platform for Polyconnect — one thermostat entity per heat pump.
 
 HVAC modes (shown in HA as the main mode selector):
     heat  → Chauffage   (heating)
     cool  → Climatisation  (cooling / "Froid" in the app)
     auto  → Auto           (automatic)
 
-    NOTE: HVACMode.OFF is intentionally excluded from hvac_modes.
-    The heat pump on/off is handled by the TURN_ON / TURN_OFF features
-    (the power button in the app). Showing "off" as a selectable mode
-    causes confusion because it's a different action from changing the mode.
-
 Preset modes (regulation sub-mode, layered on top of the HVAC mode):
-    Eco    → Eco regulation
-    Smart  → Smart regulation
-    Boost  → Boost regulation
-
-    NOTE: "Normal" is not a real app concept — omitted.
-    When no regulation mode is active, preset_mode returns None (HA shows "None").
+    Eco / Smart / Boost.
 """
 from __future__ import annotations
 
@@ -45,8 +35,6 @@ HA_HVAC_MODES = [HVACMode.HEAT, HVACMode.COOL, HVACMode.AUTO]
 
 # How long to wait after a mode change before polling the bridge for confirmation.
 # The Blazor app re-renders asynchronously; reading too early returns stale data.
-# The optimistic update handles the UI immediately; this delayed refresh confirms
-# the real device state a few seconds later.
 _MODE_REFRESH_DELAY = 8.0   # seconds
 
 
@@ -56,7 +44,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: PolyconnectCoordinator = entry.runtime_data
-    async_add_entities([PolyconnectClimate(coordinator)])
+    async_add_entities(
+        PolyconnectClimate(coordinator, pump["id"], pump["name"])
+        for pump in coordinator.pumps
+    )
 
 
 class PolyconnectClimate(PolyconnectEntity, ClimateEntity):
@@ -76,26 +67,30 @@ class PolyconnectClimate(PolyconnectEntity, ClimateEntity):
         | ClimateEntityFeature.PRESET_MODE
     )
 
-    def __init__(self, coordinator: PolyconnectCoordinator) -> None:
-        super().__init__(coordinator, "climate")
+    def __init__(
+        self,
+        coordinator: PolyconnectCoordinator,
+        pump_id: str,
+        pump_name: str,
+    ) -> None:
+        super().__init__(coordinator, pump_id, pump_name, "climate")
 
     @property
     def current_temperature(self) -> float | None:
-        if not self.coordinator.data:
-            return None
-        return self.coordinator.data.get("waterTemperature")
+        data = self._pump_data
+        return data.get("waterTemperature") if data else None
 
     @property
     def target_temperature(self) -> float | None:
-        if not self.coordinator.data:
-            return None
-        return self.coordinator.data.get("setpointTemperature")
+        data = self._pump_data
+        return data.get("setpointTemperature") if data else None
 
     @property
     def hvac_mode(self) -> HVACMode:
-        if not self.coordinator.data:
+        data = self._pump_data
+        if not data:
             return HVACMode.AUTO
-        raw_mode = self.coordinator.data.get("operatingMode", "")
+        raw_mode = data.get("operatingMode", "")
         ha_mode = POLYCONNECT_TO_HA_MODE.get(raw_mode, "auto")
         if ha_mode == "off":
             ha_mode = "auto"  # off is not a selectable mode
@@ -107,79 +102,54 @@ class PolyconnectClimate(PolyconnectEntity, ClimateEntity):
     @property
     def preset_mode(self) -> str | None:
         """Return the active regulation mode (Eco/Smart/Boost) or None."""
-        if not self.coordinator.data:
+        data = self._pump_data
+        if not data:
             return None
-        reg = self.coordinator.data.get("regulationMode")
+        reg = data.get("regulationMode")
         if reg and reg in REGULATION_MODES:
             return reg
         return None
 
+    def _optimistic_update(self, key: str, value) -> None:
+        """Mutate the cached status for this pump and push to HA immediately."""
+        data = self._pump_data
+        if data is not None:
+            data[key] = value
+            self.async_write_ha_state()
+
     async def async_set_temperature(self, **kwargs) -> None:
-        """Change the target temperature setpoint."""
         temp = kwargs.get("temperature")
         if temp is not None:
-            await self.coordinator.api.set_setpoint(float(temp))
+            await self.coordinator.api.set_setpoint(self._pump_id, float(temp))
             await self.coordinator.async_request_refresh()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Change the main operating mode (heat / cool / auto).
-
-        Uses an optimistic update so the UI reflects the change immediately,
-        then schedules a delayed refresh to confirm the real device state.
-        """
         polyconnect_mode = HA_TO_POLYCONNECT_MODE.get(hvac_mode.value, "Automatique")
-
-        # Optimistic update — UI reflects change instantly
-        if self.coordinator.data is not None:
-            self.coordinator.data["operatingMode"] = {
-                "heat": "Chauffage",
-                "cool": "Froid",
-                "auto": "Automatique",
-            }.get(hvac_mode.value, "Automatique")
-            self.async_write_ha_state()
-
-        # Send command to bridge (takes ~4s including Playwright navigation)
-        await self.coordinator.api.set_mode(polyconnect_mode)
-
-        # Delayed refresh: give Blazor time to re-render before reading state back
+        self._optimistic_update("operatingMode", {
+            "heat": "Chauffage",
+            "cool": "Froid",
+            "auto": "Automatique",
+        }.get(hvac_mode.value, "Automatique"))
+        await self.coordinator.api.set_mode(self._pump_id, polyconnect_mode)
         await asyncio.sleep(_MODE_REFRESH_DELAY)
         await self.coordinator.async_request_refresh()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Change the regulation preset (Eco / Smart / Boost).
-
-        Uses an optimistic update so the UI reflects the change immediately,
-        then schedules a delayed refresh to confirm the real device state.
-        """
         if preset_mode not in REGULATION_MODES:
             return
-
-        # Optimistic update — UI reflects change instantly
-        if self.coordinator.data is not None:
-            self.coordinator.data["regulationMode"] = preset_mode
-            self.async_write_ha_state()
-
-        # Send command to bridge
-        await self.coordinator.api.set_mode(preset_mode)
-
-        # Delayed refresh
+        self._optimistic_update("regulationMode", preset_mode)
+        await self.coordinator.api.set_mode(self._pump_id, preset_mode)
         await asyncio.sleep(_MODE_REFRESH_DELAY)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self) -> None:
-        """Turn the heat pump on."""
-        if self.coordinator.data is not None:
-            self.coordinator.data["heatPumpActive"] = True
-            self.async_write_ha_state()
-        await self.coordinator.api.turn_on()
+        self._optimistic_update("heatPumpActive", True)
+        await self.coordinator.api.turn_on(self._pump_id)
         await asyncio.sleep(3.0)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self) -> None:
-        """Turn the heat pump off."""
-        if self.coordinator.data is not None:
-            self.coordinator.data["heatPumpActive"] = False
-            self.async_write_ha_state()
-        await self.coordinator.api.turn_off()
+        self._optimistic_update("heatPumpActive", False)
+        await self.coordinator.api.turn_off(self._pump_id)
         await asyncio.sleep(3.0)
         await self.coordinator.async_request_refresh()
