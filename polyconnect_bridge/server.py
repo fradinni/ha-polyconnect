@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Polyconnect Bridge Server — HA Add-on
+"""Polyconnect Bridge Server — HA Add-on (v2: native login).
 
 Features:
 - Persistent Chromium instance for controlling Polyconnect heat pumps
-- Integrated credential capture via mitmproxy (start/stop from HA ingress)
+- Native email/password authentication against auth.pool.mytech-connect.io
+  (no more mitmproxy capture — see docs/native-login.md)
 - Credentials stored in /data/ (persistent across add-on updates)
 
 Ports:
-- 8765: Main API (HA ingress) — bridge REST + capture control + control panel
-- 8080: Phone-facing setup UI (only during capture)
-- 8888: mitmproxy (only during capture)
+- 8765: Main API (HA ingress) — bridge REST + auth control + control panel
 """
 from __future__ import annotations
 
@@ -17,24 +16,24 @@ import math, os, logging, queue, threading, time, json, sys
 from flask import Flask, jsonify, request, Response
 from pathlib import Path
 
-from capture_manager import CaptureManager, DATA_DIR
+from auth import AuthManager, DATA_DIR
 
-BRIDGE_VERSION = "1.0.6"
+BRIDGE_VERSION = "2.0.0"
 
-# ── Credential loading (from /data/ persistent storage) ───────────────────────
+# ── Auth manager (replaces v1 CaptureManager) ─────────────────────────────────
+_auth_mgr = AuthManager()
 
-_capture_mgr = CaptureManager()
 
-# Load credentials — these update dynamically after capture
 def _get_token() -> str:
-    """Get current token — re-reads from manager (may update after capture)."""
-    return _capture_mgr.credentials.token or ""
+    return _auth_mgr.credentials.token or ""
+
 
 def _get_heat_pump_id() -> str:
-    return _capture_mgr.credentials.heat_pump_id or ""
+    return _auth_mgr.credentials.heat_pump_id or ""
+
 
 def _get_installation_id() -> str:
-    return _capture_mgr.credentials.installation_id or ""
+    return _auth_mgr.credentials.installation_id or ""
 
 
 LOG_LEVEL = os.environ.get("POLYCONNECT_LOG_LEVEL", "info").upper()
@@ -317,9 +316,9 @@ class PolyconnectController:
         token = _get_token()
         heat_pump = _get_heat_pump_id()
         if not token:
-            raise RuntimeError("No session token configured — run capture first")
+            raise RuntimeError("No session token — configure POLYCONNECT_EMAIL / POLYCONNECT_PASSWORD")
         if not heat_pump:
-            raise RuntimeError("No heat pump ID configured — run capture first")
+            raise RuntimeError("No heat pump ID configured — set heat_pump_id in add-on options")
 
         if self._pw:
             try: self._pw.stop()
@@ -366,7 +365,12 @@ class PolyconnectController:
             pass
         body = page.evaluate("() => document.body.innerText.substring(0, 200)")
         if "403" in body or "must be connected" in body.lower():
-            raise RuntimeError("Session token expired — recapture needed")
+            # v2: silently re-login. Caller's _ensure() will relaunch with a fresh token.
+            log.warning("Session token expired — refreshing …")
+            res = _auth_mgr.refresh()
+            if not res.get("ok"):
+                raise RuntimeError(f"Session token expired and refresh failed: {res.get('error')}")
+            raise RuntimeError("Session token expired — refreshed, will retry")
         page.evaluate(
             f"Blazor._internal.navigationManager.navigateTo("
             f"'{BASE}/heat-pump-view/{heat_pump}', false)")
@@ -381,7 +385,11 @@ class PolyconnectController:
         log.debug("App loaded — data ready after %.0fms", wait_ms)
         body = page.evaluate("() => document.body.innerText.substring(0, 200)")
         if "403" in body or "must be connected" in body.lower():
-            raise RuntimeError("Session token expired — recapture needed")
+            log.warning("Session token expired post-load — refreshing …")
+            res = _auth_mgr.refresh()
+            if not res.get("ok"):
+                raise RuntimeError(f"Session token expired and refresh failed: {res.get('error')}")
+            raise RuntimeError("Session token expired — refreshed, will retry")
         log.info("Browser launched and heat pump view loaded")
 
     def _ensure(self):
@@ -396,7 +404,8 @@ class PolyconnectController:
             snippet = self._page.evaluate(
                 "() => document.body.innerText.substring(0, 120)")
             if "403" in snippet or "must be connected" in snippet.lower():
-                log.warning("Session token expired — closing browser")
+                log.warning("Session token expired — refreshing and relaunching browser")
+                _auth_mgr.refresh()
                 try:
                     self._browser.close()
                     self._pw.stop()
@@ -405,7 +414,7 @@ class PolyconnectController:
                 self._browser = None
                 self._pw      = None
                 self._page    = None
-                raise RuntimeError("Session token expired — recapture needed")
+                raise RuntimeError("Session token expired — refreshed, will retry")
         except RuntimeError:
             raise
         except Exception:
@@ -471,7 +480,8 @@ class PolyconnectController:
             snippet = self._page.evaluate(
                 "() => document.body.innerText.substring(0, 200)")
             if "403" in snippet or "must be connected" in snippet.lower():
-                log.warning("Token expired detected during get_status — closing browser")
+                log.warning("Token expired during get_status — refreshing and closing browser")
+                _auth_mgr.refresh()
                 try:
                     self._browser.close()
                     self._pw.stop()
@@ -480,7 +490,7 @@ class PolyconnectController:
                 self._browser = None
                 self._pw      = None
                 self._page    = None
-                raise RuntimeError("Session token expired — recapture needed")
+                raise RuntimeError("Session token expired — refreshed, will retry")
             # Open the info panel to expose compressor / filtration status
             _info_sel = self._page.evaluate(_OPEN_INFO_PANEL_JS)
             if _info_sel:
@@ -860,16 +870,15 @@ class PolyconnectController:
 ctrl = PolyconnectController()
 app  = Flask(__name__)
 
-_setup_server = None  # reference to the phone-facing HTTP server
-
 
 def _safe(fn, *a, **kw):
     try:
         return fn(*a, **kw), 200
     except RuntimeError as e:
-        if "expired" in str(e).lower() or "recapture" in str(e).lower():
+        msg = str(e).lower()
+        if "expired" in msg or "refreshed" in msg or "recapture" in msg:
             return {"error": str(e), "auth_expired": True}, 401
-        if "no session token" in str(e).lower() or "no heat pump" in str(e).lower():
+        if "no session token" in msg or "no heat pump" in msg:
             return {"error": str(e), "credentials_missing": True}, 503
         return {"error": str(e)}, 500
     except Exception as e:
@@ -881,13 +890,17 @@ def _safe(fn, *a, **kw):
 
 @app.route("/health")
 def health():
-    creds = _capture_mgr.credentials
+    creds = _auth_mgr.credentials
+    auth_status = _auth_mgr.get_status()
     return jsonify({
         "ok": True,
         "service": "polyconnect-bridge",
         "version": BRIDGE_VERSION,
         "credentials_configured": creds.is_complete,
-        "capture_phase": _capture_mgr.status.phase.value,
+        "email_configured": auth_status["email_configured"],
+        "terminal_registered": auth_status["terminal_registered"],
+        "session_age_seconds": auth_status["session_age_seconds"],
+        "last_error": auth_status["last_error"],
     })
 
 
@@ -1035,49 +1048,41 @@ def filtration_stop():
     return jsonify(data), code
 
 
-# ── Capture API routes (new) ──────────────────────────────────────────────────
+# ── Auth API routes (v2) ──────────────────────────────────────────────────────
 
-@app.route("/capture/status")
-def capture_status():
-    return jsonify(_capture_mgr.get_status())
-
-
-@app.route("/capture/start", methods=["POST"])
-def capture_start():
-    global _setup_server
-    result = _capture_mgr.start_capture()
-    if result.get("ok") and _setup_server is None:
-        from setup_ui import start_setup_server
-        _setup_server = start_setup_server(_capture_mgr)
-        log.info("Setup UI server started on port 8080")
-    return jsonify(result)
+@app.route("/auth/status")
+def auth_status():
+    return jsonify(_auth_mgr.get_status())
 
 
-@app.route("/capture/stop", methods=["POST"])
-def capture_stop():
-    global _setup_server
-    result = _capture_mgr.stop_capture()
-    if _setup_server:
-        from setup_ui import stop_setup_server
-        stop_setup_server(_setup_server)
-        _setup_server = None
-        log.info("Setup UI server stopped")
-    return jsonify(result)
+@app.route("/auth/refresh", methods=["POST"])
+def auth_refresh():
+    """Force a new login round-trip with the currently-configured credentials."""
+    return jsonify(_auth_mgr.refresh())
 
 
-@app.route("/capture/reset", methods=["POST"])
-def capture_reset():
-    global _setup_server
-    # Stop capture if running
-    if _capture_mgr.status.phase.value != "idle":
-        _capture_mgr.stop_capture()
-        if _setup_server:
-            from setup_ui import stop_setup_server
-            stop_setup_server(_setup_server)
-            _setup_server = None
-    # Clear credentials
-    _capture_mgr.reset_credentials()
-    return jsonify({"ok": True, "message": "Credentials cleared. Start capture to recapture."})
+@app.route("/auth/credentials", methods=["POST"])
+def auth_set_credentials():
+    """Update email/password and (optionally) the heat pump / installation IDs.
+    Triggers an immediate login attempt."""
+    body = request.get_json(silent=True) or {}
+    email = body.get("email", "")
+    password = body.get("password", "")
+    if not email or not password:
+        return jsonify({"ok": False, "error": "email and password are required"}), 400
+    return jsonify(_auth_mgr.set_credentials(
+        email=email,
+        password=password,
+        installation_id=body.get("installation_id"),
+        heat_pump_id=body.get("heat_pump_id"),
+    ))
+
+
+@app.route("/auth/reset", methods=["POST"])
+def auth_reset():
+    """Wipe terminal + session + IDs. Next call re-registers from scratch."""
+    _auth_mgr.reset_credentials()
+    return jsonify({"ok": True, "message": "Auth state cleared."})
 
 
 # ── Ingress Control Panel (HTML at /) ─────────────────────────────────────────
@@ -1085,18 +1090,16 @@ def capture_reset():
 @app.route("/")
 def ingress_panel():
     """Serve the control panel visible through HA ingress."""
-    # Extract HA host IP from the request (what the user types in their browser)
-    host_header = request.headers.get("Host", "")
-    ha_host_ip = host_header.split(":")[0] if host_header else ""
-    return Response(_build_ingress_html(ha_host_ip), mimetype="text/html")
+    return Response(_build_ingress_html(), mimetype="text/html")
 
 
-def _build_ingress_html(ha_host_ip: str = "") -> str:
-    creds = _capture_mgr.credentials
-    phase = _capture_mgr.status.phase.value
-    # Use the HA host IP (what the user's browser connects to) for the phone URL
-    # Port 8080 is mapped from container to host by the Supervisor
-    phone_ip = ha_host_ip or "your-ha-ip"
+def _build_ingress_html() -> str:
+    creds = _auth_mgr.credentials
+    st = _auth_mgr.get_status()
+    email_disp = st.get("email") or ""
+    session_age = st.get("session_age_seconds")
+    age_disp = f"{session_age}s" if session_age is not None else "—"
+    last_err = st.get("last_error") or ""
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -1113,9 +1116,9 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 .subtitle {{ color:var(--dim); font-size:0.82rem; margin-bottom:1.5rem; }}
 .card {{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin-bottom:1rem; }}
 .card h2 {{ font-size:0.9rem; color:var(--accent); margin-bottom:0.7rem; }}
-.row {{ display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; }}
+.row {{ display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; gap:0.5rem; }}
 .row .label {{ color:var(--dim); font-size:0.8rem; }}
-.row .value {{ font-size:0.8rem; font-family:monospace; }}
+.row .value {{ font-size:0.8rem; font-family:monospace; word-break:break-all; text-align:right; }}
 .ok {{ color:var(--green); }}
 .warn {{ color:var(--yellow); }}
 .err {{ color:var(--red); }}
@@ -1124,76 +1127,77 @@ h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
 .btn-danger {{ background:var(--red); color:white; }}
 .btn-outline {{ background:transparent; border:1px solid var(--border); color:var(--text); }}
 .btn:hover {{ opacity:0.9; }}
-.phone-url {{ background:var(--bg); border:1px solid var(--accent); border-radius:8px; padding:0.8rem; text-align:center; margin:0.8rem 0; }}
-.phone-url .label {{ font-size:0.7rem; color:var(--dim); text-transform:uppercase; }}
-.phone-url .url {{ font-size:1.1rem; font-weight:700; color:var(--accent); font-family:monospace; }}
-#capture-section {{ display: {"block" if phase != "idle" else "none"}; }}
+.btn:disabled {{ opacity:0.4; cursor:not-allowed; }}
+label {{ display:block; color:var(--dim); font-size:0.75rem; margin-top:0.7rem; margin-bottom:0.3rem; text-transform:uppercase; }}
+input {{ width:100%; padding:0.55rem 0.7rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); font-family:monospace; font-size:0.85rem; }}
+input:focus {{ outline:none; border-color:var(--accent); }}
+.help {{ color:var(--dim); font-size:0.75rem; margin-top:0.5rem; line-height:1.4; }}
+.err-banner {{ background:rgba(248,113,113,0.1); border:1px solid var(--red); color:var(--red); padding:0.6rem 0.8rem; border-radius:6px; font-size:0.8rem; margin-bottom:0.8rem; display:none; }}
 </style>
 </head>
 <body>
 <div class="container">
     <h1>Polyconnect Bridge</h1>
-    <p class="subtitle">v{BRIDGE_VERSION} — Pool heat pump control via Playwright</p>
+    <p class="subtitle">v{BRIDGE_VERSION} — Native login (no mitmproxy)</p>
 
-    <!-- Credentials Status -->
+    <!-- Auth status -->
     <div class="card">
-        <h2>Credentials</h2>
+        <h2>Auth status</h2>
         <div class="row">
-            <span class="label">Token</span>
-            <span class="value {'ok' if creds.token else 'warn'}">{'Configured (' + str(len(creds.token)) + ' chars)' if creds.token else 'Not captured'}</span>
+            <span class="label">Email</span>
+            <span class="value {'ok' if st['email_configured'] else 'warn'}">{email_disp or 'Not configured'}</span>
         </div>
         <div class="row">
-            <span class="label">Heat Pump ID</span>
-            <span class="value {'ok' if creds.heat_pump_id else 'warn'}">{creds.heat_pump_id or 'Not captured'}</span>
+            <span class="label">Terminal</span>
+            <span class="value {'ok' if st['terminal_registered'] else 'warn'}">{(st['terminal_id'] or 'Not registered')}</span>
+        </div>
+        <div class="row">
+            <span class="label">Session</span>
+            <span class="value {'ok' if creds.token else 'warn'}">{('Active (' + str(len(creds.token)) + ' chars, ' + age_disp + ')') if creds.token else 'Not acquired'}</span>
+        </div>
+        <div class="row">
+            <span class="label">Heat pump ID</span>
+            <span class="value {'ok' if creds.heat_pump_id else 'warn'}">{creds.heat_pump_id or 'Not set'}</span>
         </div>
         <div class="row">
             <span class="label">Installation ID</span>
-            <span class="value {'ok' if creds.installation_id else 'warn'}">{creds.installation_id or 'Not captured'}</span>
+            <span class="value {'ok' if creds.installation_id else 'warn'}">{creds.installation_id or 'Not set'}</span>
         </div>
         <div class="row">
-            <span class="label">Status</span>
-            <span class="value {'ok' if creds.is_complete else 'warn'}">{'Ready' if creds.is_complete else 'Incomplete — capture needed'}</span>
+            <span class="label">Overall</span>
+            <span class="value {'ok' if creds.is_complete else 'warn'}">{'Ready' if creds.is_complete else 'Incomplete'}</span>
         </div>
+        {f'<div class="row"><span class="label">Last error</span><span class="value err">{last_err}</span></div>' if last_err else ''}
     </div>
 
-    <!-- Capture Controls -->
+    <!-- Credentials form -->
     <div class="card">
-        <h2>Credential Capture</h2>
-        <p style="color:var(--dim); font-size:0.8rem; margin-bottom:0.8rem;">
-            Capture your Polyconnect credentials by proxying your phone's traffic.
-            This requires your phone to be on the same WiFi network.
+        <h2>Credentials</h2>
+        <p class="help">
+            Login uses the same email/password as the official Polyconnect mobile app.
+            Credentials and IDs can also be set as add-on options (preferred) — the form
+            below updates them at runtime.
         </p>
-        <div>
-            <button class="btn btn-primary" onclick="startCapture()" id="btn-start">Start Capture</button>
-            <button class="btn btn-outline" onclick="stopCapture()" id="btn-stop" style="display:none;">Stop Capture</button>
-            <button class="btn btn-danger" onclick="resetCredentials()">Reset Credentials</button>
-        </div>
-
-        <div id="capture-section">
-            <div class="phone-url">
-                <div class="label">Open this on your phone:</div>
-                <div class="url" id="phone-url">http://{phone_ip}:8080</div>
+        <div id="err-banner" class="err-banner"></div>
+        <form id="cred-form">
+            <label>Email</label>
+            <input type="email" id="f-email" value="{email_disp}" autocomplete="username" required>
+            <label>Password</label>
+            <input type="password" id="f-password" autocomplete="current-password" required placeholder="Re-enter to update">
+            <label>Heat pump ID <span style="text-transform:none;">(24-char hex)</span></label>
+            <input type="text" id="f-heat-pump" value="{creds.heat_pump_id or ''}" pattern="[0-9a-f]{{24}}">
+            <label>Installation ID <span style="text-transform:none;">(24-char hex, optional)</span></label>
+            <input type="text" id="f-install" value="{creds.installation_id or ''}" pattern="[0-9a-f]{{24}}">
+            <div style="margin-top:1rem;">
+                <button type="submit" class="btn btn-primary" id="btn-save">Save &amp; login</button>
+                <button type="button" class="btn btn-outline" id="btn-refresh">Refresh session</button>
+                <button type="button" class="btn btn-danger" id="btn-reset">Reset auth state</button>
             </div>
-            <div class="row">
-                <span class="label">Capture Phase</span>
-                <span class="value" id="cap-phase">{phase}</span>
-            </div>
-        </div>
-    </div>
-
-    <!-- Bridge Status -->
-    <div class="card">
-        <h2>Bridge</h2>
-        <div class="row">
-            <span class="label">Playwright</span>
-            <span class="value" id="bridge-status">{'Ready' if creds.is_complete else 'Waiting for credentials'}</span>
-        </div>
+        </form>
     </div>
 </div>
 
 <script>
-// Use document.baseURI which HA sets correctly for ingress panels,
-// or fall back to detecting from the iframe URL
 const BASE = (() => {{
     try {{
         if (window.location.pathname.includes('/api/hassio_ingress/')) {{
@@ -1209,86 +1213,59 @@ const BASE = (() => {{
     return '/';
 }})();
 
-// HA host IP for phone URL (extracted from the page's host, same machine)
-const HA_HOST = window.location.hostname || '{phone_ip}';
+function showError(msg) {{
+    const b = document.getElementById('err-banner');
+    b.textContent = msg;
+    b.style.display = 'block';
+}}
+function clearError() {{ document.getElementById('err-banner').style.display = 'none'; }}
 
-function startCapture() {{
-    const btn = document.getElementById('btn-start');
-    btn.disabled = true;
-    btn.textContent = 'Starting...';
-    btn.style.opacity = '0.6';
-    fetch(BASE + 'capture/start', {{method: 'POST'}})
-        .then(r => r.json())
-        .then(d => {{
-            if (d.ok) {{
-                btn.textContent = 'Started! Loading...';
-                setTimeout(() => location.reload(), 1000);
-            }} else {{
-                btn.disabled = false;
-                btn.textContent = 'Start Capture';
-                btn.style.opacity = '1';
-                alert(d.error || 'Failed to start capture');
-            }}
-        }})
-        .catch(e => {{
-            btn.disabled = false;
-            btn.textContent = 'Start Capture';
-            btn.style.opacity = '1';
-            alert('Request failed: ' + e);
+document.getElementById('cred-form').addEventListener('submit', async (e) => {{
+    e.preventDefault();
+    clearError();
+    const btn = document.getElementById('btn-save');
+    btn.disabled = true; btn.textContent = 'Logging in…';
+    const body = {{
+        email: document.getElementById('f-email').value.trim(),
+        password: document.getElementById('f-password').value,
+        heat_pump_id: document.getElementById('f-heat-pump').value.trim() || null,
+        installation_id: document.getElementById('f-install').value.trim() || null,
+    }};
+    try {{
+        const r = await fetch(BASE + 'auth/credentials', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify(body),
         }});
-}}
-function stopCapture() {{
-    const btn = document.getElementById('btn-stop');
-    btn.disabled = true;
-    btn.textContent = 'Stopping...';
-    fetch(BASE + 'capture/stop', {{method: 'POST'}})
-        .then(r => r.json())
-        .then(() => location.reload());
-}}
-function resetCredentials() {{
-    if (!confirm('Clear all credentials? You will need to recapture them.')) return;
-    const btn = event.target;
-    btn.disabled = true;
-    btn.textContent = 'Clearing...';
-    fetch(BASE + 'capture/reset', {{method: 'POST'}})
-        .then(r => r.json())
-        .then(() => location.reload());
-}}
+        const d = await r.json();
+        if (d.ok) location.reload();
+        else {{ showError(d.error || 'Login failed'); btn.disabled = false; btn.textContent = 'Save & login'; }}
+    }} catch (ex) {{
+        showError('Request failed: ' + ex);
+        btn.disabled = false; btn.textContent = 'Save & login';
+    }}
+}});
 
-// Poll capture status
-function pollStatus() {{
-    fetch(BASE + 'capture/status')
-        .then(r => r.json())
-        .then(d => {{
-            const cap = d.capture || {{}};
-            const phase = cap.phase || 'idle';
-            const sec = document.getElementById('capture-section');
-            const btnStart = document.getElementById('btn-start');
-            const btnStop = document.getElementById('btn-stop');
+document.getElementById('btn-refresh').addEventListener('click', async () => {{
+    clearError();
+    const btn = document.getElementById('btn-refresh');
+    btn.disabled = true; btn.textContent = 'Refreshing…';
+    try {{
+        const r = await fetch(BASE + 'auth/refresh', {{method: 'POST'}});
+        const d = await r.json();
+        if (d.ok) location.reload();
+        else {{ showError(d.error || 'Refresh failed'); btn.disabled = false; btn.textContent = 'Refresh session'; }}
+    }} catch (ex) {{
+        showError('Request failed: ' + ex);
+        btn.disabled = false; btn.textContent = 'Refresh session';
+    }}
+}});
 
-            if (phase === 'running' || phase === 'complete') {{
-                sec.style.display = 'block';
-                btnStart.style.display = 'none';
-                btnStop.style.display = 'inline-block';
-                // Use the HA host IP (same machine the user is connected to)
-                document.getElementById('phone-url').textContent =
-                    'http://' + HA_HOST + ':8080';
-            }} else {{
-                sec.style.display = 'none';
-                btnStart.style.display = 'inline-block';
-                btnStop.style.display = 'none';
-            }}
-            document.getElementById('cap-phase').textContent = phase;
-
-            // Auto-reload when capture completes
-            if (phase === 'complete' || (d.credentials && d.credentials.complete)) {{
-                setTimeout(() => location.reload(), 2000);
-            }}
-        }})
-        .catch(() => {{}});
-}}
-setInterval(pollStatus, 3000);
-pollStatus();
+document.getElementById('btn-reset').addEventListener('click', async () => {{
+    if (!confirm('Wipe all auth state? Terminal will need to re-register and you will need to log in again.')) return;
+    await fetch(BASE + 'auth/reset', {{method: 'POST'}});
+    location.reload();
+}});
 </script>
 </body>
 </html>'''
@@ -1299,14 +1276,14 @@ pollStatus();
 if __name__ == "__main__":
     log.info("Starting Polyconnect Bridge v%s on port %d", BRIDGE_VERSION, PORT)
 
-    if _capture_mgr.credentials.is_complete:
-        log.info("Credentials loaded — launching Playwright browser")
+    if _auth_mgr.credentials.is_complete:
+        log.info("Credentials ready — launching Playwright browser")
         try:
             ctrl._pw_thread.call(ctrl._launch)
         except Exception as e:
             log.warning("Pre-launch failed: %s — will retry on first request", e)
     else:
-        log.warning("Credentials incomplete — open the add-on UI to run capture")
+        log.warning("Credentials incomplete — open the add-on UI to log in")
 
     from waitress import serve
     serve(app, host="0.0.0.0", port=PORT, threads=8)

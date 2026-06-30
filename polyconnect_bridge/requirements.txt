@@ -1,5 +1,5 @@
 flask>=3.0.0
 waitress>=3.0.0
 playwright>=1.44.0
-mitmproxy>=10.0.0
-certifi>=2024.1.0
+requests>=2.31.0
+pycryptodome>=3.20.0
