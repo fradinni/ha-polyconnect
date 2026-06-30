@@ -18,7 +18,7 @@ from pathlib import Path
 
 from auth import AuthManager, DATA_DIR
 
-BRIDGE_VERSION = "2.0.0"
+BRIDGE_VERSION = "2.1.0"
 
 # ── Auth manager (replaces v1 CaptureManager) ─────────────────────────────────
 _auth_mgr = AuthManager()
@@ -29,11 +29,32 @@ def _get_token() -> str:
 
 
 def _get_heat_pump_id() -> str:
+    """Back-compat helper: first pump's id (or empty)."""
     return _auth_mgr.credentials.heat_pump_id or ""
 
 
 def _get_installation_id() -> str:
     return _auth_mgr.credentials.installation_id or ""
+
+
+def _get_pumps() -> list[dict]:
+    """Return the full discovered pump list: [{id, name}, ...]."""
+    return list(_auth_mgr.credentials.heat_pumps or [])
+
+
+def _resolve_pump(pump_id: str | None) -> str | None:
+    """Validate a caller-supplied pump_id against the discovered list.
+    Returns the canonical id, or None when missing/unknown. Accepts None
+    to mean "the default pump" (first in the list)."""
+    pumps = _get_pumps()
+    if not pumps:
+        return None
+    if not pump_id:
+        return pumps[0]["id"]
+    for p in pumps:
+        if p["id"] == pump_id:
+            return p["id"]
+    return None
 
 
 LOG_LEVEL = os.environ.get("POLYCONNECT_LOG_LEVEL", "info").upper()
@@ -310,9 +331,13 @@ class PolyconnectController:
         self._browser= None
         self._ctx    = None
         self._page   = None
-        self._last_data: dict | None = None
-        self._last_change_ts: float  = time.time()
-        self._unchanged_count: int   = 0
+        # Which pump's /heat-pump-view/<id> the single Chromium page is currently on.
+        # Smart-navigation only navigateTo's when the active pump differs.
+        self._current_pump_id: str | None = None
+        # Staleness detection state, per-pump.
+        self._last_data: dict[str, dict] = {}
+        self._last_change_ts: dict[str, float] = {}
+        self._unchanged_count: dict[str, int] = {}
 
     def _launch(self):
         from playwright.sync_api import sync_playwright
@@ -349,8 +374,11 @@ class PolyconnectController:
             raise
 
     def _load_app(self):
+        """Bootstrap the Blazor SPA from /from-native/<token>.
+        On first boot (no pumps discovered yet) enumerate all pumps from
+        the installation-overview page. Leaves the page on /heat-pump-view/<first_pump>.
+        """
         token = _get_token()
-        heat_pump = _get_heat_pump_id()
         page = self._page
         page.goto(f"{BASE}/from-native/{token}", wait_until="domcontentloaded", timeout=30_000)
         try:
@@ -375,31 +403,18 @@ class PolyconnectController:
             raise RuntimeError("Session token expired — refreshed, will retry")
 
         # ── First-boot ID discovery ───────────────────────────────────────────
-        # Without IDs we let the SPA route itself to its default landing page
-        # (/installation-overview/<id>), pluck the installation_id from the
-        # URL, then click the heat-pump card to land on /heat-pump-view/<id>.
-        if not heat_pump:
-            heat_pump = self._discover_ids()
-            if not heat_pump:
+        pumps = _get_pumps()
+        if not pumps:
+            pumps = self._discover_ids()
+            if not pumps:
                 raise RuntimeError(
-                    "Could not auto-discover heat pump ID — "
-                    "set heat_pump_id in add-on options manually.")
-            # _discover_ids leaves the page on /heat-pump-view/<id> already,
-            # so the explicit navigateTo below is a no-op (same URL). Keeping
-            # it as the canonical entry path for the reload codepath.
+                    "Could not auto-discover any heat pumps — "
+                    "check that the account has at least one configured pump.")
 
-        page.evaluate(
-            f"Blazor._internal.navigationManager.navigateTo("
-            f"'{BASE}/heat-pump-view/{heat_pump}', false)")
-        try:
-            page.wait_for_selector(
-                ".co-gauge-container, .heat-pump-view-mode-container, "
-                ".order-and-value-item, .heat-pump-mode",
-                timeout=12_000)
-        except Exception:
-            pass
-        wait_ms = self._wait_for_data(timeout_ms=10_000)
-        log.debug("App loaded — data ready after %.0fms", wait_ms)
+        # Navigate to the default (first) pump's view.
+        default_pump = pumps[0]["id"]
+        self._current_pump_id = None  # force navigation
+        self._navigate_to_pump(default_pump)
         body = page.evaluate("() => document.body.innerText.substring(0, 200)")
         if "403" in body or "must be connected" in body.lower():
             log.warning("Session token expired post-load — refreshing …")
@@ -407,69 +422,149 @@ class PolyconnectController:
             if not res.get("ok"):
                 raise RuntimeError(f"Session token expired and refresh failed: {res.get('error')}")
             raise RuntimeError("Session token expired — refreshed, will retry")
-        log.info("Browser launched and heat pump view loaded")
+        log.info("Browser launched, default pump view loaded (%d pump(s) total)", len(pumps))
 
-    def _discover_ids(self) -> str | None:
-        """Auto-discover installation_id + heat_pump_id from the Blazor SPA.
-
-        Strategy (verified empirically — see docs/native-login.md §8):
-          1. /from-native/<token> already loaded; SPA auto-routes to its
-             default landing page = /installation-overview/<installation_id>.
-          2. Pluck installation_id from the URL.
-          3. Click .device-summary-item.mobile-clickable → SPA navigates to
-             /heat-pump-view/<heat_pump_id>. Pluck the ID and return it.
-
-        For multi-heat-pump installations the FIRST card wins. v2 single-device
-        parity; multi-device support can pick by name later.
-        Returns heat_pump_id on success, None on failure.
-        """
+    def _navigate_to_pump(self, pump_id: str) -> None:
+        """Smart-navigate the SPA to /heat-pump-view/<pump_id>. No-op if already there."""
+        if self._current_pump_id == pump_id and "heat-pump-view" in (self._page.url or ""):
+            return
         page = self._page
-        log.info("Discovering installation / heat-pump IDs from SPA …")
-
-        # Wait for the SPA's default route — it lands on /installation-overview/<id>
+        log.debug("Navigating SPA to heat-pump-view/%s (from %s)", pump_id, self._current_pump_id)
+        page.evaluate(
+            f"Blazor._internal.navigationManager.navigateTo("
+            f"'{BASE}/heat-pump-view/{pump_id}', false)")
         try:
             page.wait_for_function(
-                f"() => /\\/installation-overview\\/[0-9a-f]{{24}}/.test(window.location.pathname)"
-                f" || /\\/heat-pump-view\\/[0-9a-f]{{24}}/.test(window.location.pathname)",
+                f"() => /\\/heat-pump-view\\/{pump_id}/.test(window.location.pathname)",
+                timeout=8_000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector(
+                ".co-gauge-container, .heat-pump-view-mode-container, "
+                ".order-and-value-item, .heat-pump-mode",
+                timeout=12_000)
+        except Exception:
+            pass
+        self._wait_for_data(timeout_ms=10_000)
+        self._current_pump_id = pump_id
+
+    def _discover_ids(self) -> list[dict]:
+        """Auto-discover installation_id + the full list of heat pumps from the SPA.
+
+        Strategy (verified empirically — see docs/native-login.md §8):
+          1. /from-native/<token> already loaded; SPA auto-routes to
+             /installation-overview/<installation_id>.
+          2. Pluck installation_id from the URL.
+          3. Read all `.device-summary-item.mobile-clickable` cards on the page:
+             extract their display name (.device-summary-title) and click them
+             one-by-one to capture each /heat-pump-view/<id> URL.
+          4. Persist [{id, name}, ...] via auth_mgr.set_pumps().
+
+        Returns the discovered pump list (possibly empty on failure).
+        """
+        page = self._page
+        log.info("Discovering installation + heat-pump IDs from SPA …")
+
+        # Wait for the SPA's default route (installation-overview or direct heat-pump-view).
+        try:
+            page.wait_for_function(
+                "() => /\\/installation-overview\\/[0-9a-f]{24}/.test(window.location.pathname)"
+                " || /\\/heat-pump-view\\/[0-9a-f]{24}/.test(window.location.pathname)",
                 timeout=15_000)
         except Exception:
             log.warning("SPA did not auto-route to a known view (url=%s)", page.url)
 
-        m = _OBJECTID_RE.search(page.url)
-        installation_id = m.group(1) if m and "installation-overview" in page.url else None
-        heat_pump_id = m.group(1) if m and "heat-pump-view" in page.url else None
+        installation_id: str | None = None
+        m = _OBJECTID_RE.search(page.url or "")
 
-        # If we landed on heat-pump-view straight away (deep link / single-device
-        # shortcut), we already have heat_pump_id — done.
-        if heat_pump_id:
-            _auth_mgr.set_ids(installation_id=installation_id, heat_pump_id=heat_pump_id)
-            log.info("Discovered (deep-link) heat_pump_id=%s", heat_pump_id)
-            return heat_pump_id
+        # Deep-link shortcut: SPA landed directly on a heat-pump-view (rare —
+        # happens when the account has a single pump and the server skips the
+        # overview screen). We have one pump_id but no installation_id and
+        # no name from a card. Best we can do is record the single pump.
+        if m and "heat-pump-view" in page.url:
+            pump_id = m.group(1)
+            pumps = [{"id": pump_id, "name": "Heat pump"}]
+            _auth_mgr.set_pumps(installation_id=None, heat_pumps=pumps)
+            log.info("Discovered (deep-link) single pump: %s", pump_id)
+            return pumps
 
-        if not installation_id:
+        if not (m and "installation-overview" in page.url):
             log.error("Could not find installation_id in landing URL: %s", page.url)
-            return None
+            return []
+        installation_id = m.group(1)
         log.info("Discovered installation_id=%s", installation_id)
 
-        # Click the first heat-pump card to navigate to /heat-pump-view/<id>
+        # Enumerate cards. We read names BEFORE clicking — once we click,
+        # the SPA navigates away and the cards detach. The list order matches
+        # what we click in step 2.
         try:
             page.wait_for_selector(".device-summary-item.mobile-clickable", timeout=10_000)
-            page.click(".device-summary-item.mobile-clickable")
+            # The .device-summary-title child renders a beat later than the
+            # parent — wait for at least one non-empty title before reading.
             page.wait_for_function(
-                f"() => /\\/heat-pump-view\\/[0-9a-f]{{24}}/.test(window.location.pathname)",
-                timeout=10_000)
-        except Exception as e:
-            log.error("Could not click heat-pump card / navigate: %s", e)
-            return None
+                "() => Array.from(document.querySelectorAll('.device-summary-item.mobile-clickable "
+                ".device-summary-title')).some(e => e.textContent.trim().length > 0)",
+                timeout=5_000)
+        except Exception:
+            log.warning("Pump card titles did not render — names may fall back to 'Heat pump N'")
 
-        m = _OBJECTID_RE.search(page.url)
-        if not m:
-            log.error("No heat_pump_id in URL after click: %s", page.url)
-            return None
-        heat_pump_id = m.group(1)
-        _auth_mgr.set_ids(installation_id=installation_id, heat_pump_id=heat_pump_id)
-        log.info("Discovered heat_pump_id=%s", heat_pump_id)
-        return heat_pump_id
+        card_names = page.evaluate("""() => {
+            const out = [];
+            for (const el of document.querySelectorAll('.device-summary-item.mobile-clickable')) {
+                const title = el.querySelector('.device-summary-title');
+                let name = (title && title.textContent.trim()) || '';
+                if (!name) {
+                    // Fallback: first line of the card's full text content
+                    const txt = el.textContent.trim();
+                    name = txt.split('\\n')[0].trim();
+                }
+                out.push(name || 'Heat pump');
+            }
+            return out;
+        }""")
+        log.info("Found %d heat-pump card(s): %s", len(card_names), card_names)
+
+        pumps: list[dict] = []
+        seen_ids: set[str] = set()
+        for index, name in enumerate(card_names):
+            try:
+                # Re-navigate to overview between clicks so the cards are mounted again.
+                if index > 0:
+                    page.evaluate(
+                        f"Blazor._internal.navigationManager.navigateTo("
+                        f"'{BASE}/installation-overview/{installation_id}', false)")
+                    page.wait_for_selector(".device-summary-item.mobile-clickable", timeout=10_000)
+
+                # Click the Nth card (0-based)
+                page.eval_on_selector_all(
+                    ".device-summary-item.mobile-clickable",
+                    f"(els) => els[{index}] && els[{index}].click()")
+                page.wait_for_function(
+                    "() => /\\/heat-pump-view\\/[0-9a-f]{24}/.test(window.location.pathname)",
+                    timeout=10_000)
+                cur = _OBJECTID_RE.search(page.url or "")
+                if not cur:
+                    log.warning("Card %d (%r): no pump_id in URL after click (%s)",
+                                index, name, page.url)
+                    continue
+                pid = cur.group(1)
+                if pid in seen_ids:
+                    log.warning("Card %d (%r) resolved to duplicate id %s — skipping",
+                                index, name, pid)
+                    continue
+                seen_ids.add(pid)
+                pumps.append({"id": pid, "name": name})
+                log.info("  card %d: %s -> %s", index, name, pid)
+            except Exception as e:
+                log.warning("Card %d (%r) discovery failed: %s", index, name, e)
+
+        if not pumps:
+            log.error("Discovered no pumps despite finding %d card(s)", len(card_names))
+            return []
+
+        _auth_mgr.set_pumps(installation_id=installation_id, heat_pumps=pumps)
+        return pumps
 
     def _ensure(self):
         if self._browser and self._browser.is_connected():
@@ -477,8 +572,9 @@ class PolyconnectController:
         log.info("(Re-)launching browser …")
         self._launch()
 
-    def _ensure_view(self):
-        heat_pump = _get_heat_pump_id()
+    def _ensure_view(self, pump_id: str) -> None:
+        """Ensure the page is on /heat-pump-view/<pump_id>.
+        Detects expired sessions and refreshes; smart-navigates between pumps."""
         try:
             snippet = self._page.evaluate(
                 "() => document.body.innerText.substring(0, 120)")
@@ -499,16 +595,7 @@ class PolyconnectController:
         except Exception:
             pass
 
-        if "heat-pump-view" not in self._page.url:
-            self._page.evaluate(
-                f"Blazor._internal.navigationManager.navigateTo("
-                f"'{BASE}/heat-pump-view/{heat_pump}', false)")
-            try:
-                self._page.wait_for_selector(
-                    ".co-gauge-container, .heat-pump-view-mode-container",
-                    timeout=8_000)
-            except Exception:
-                time.sleep(2)
+        self._navigate_to_pump(pump_id)
 
     # ── get_status ────────────────────────────────────────────────────────────
 
@@ -530,32 +617,28 @@ class PolyconnectController:
             pass
         return (time.time() - t0) * 1000
 
-    def get_status(self) -> dict:
+    def get_status(self, pump_id: str | None = None) -> dict:
         with self._lock:
             self._ensure()
-            self._ensure_view()
-            heat_pump = _get_heat_pump_id()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
+            # If this is a re-visit to a pump we've already been on, briefly
+            # bounce to installation-overview and back to force a re-render —
+            # Blazor sometimes caches the prior pump's DOM otherwise.
             installation_id = _get_installation_id()
-            self._page.evaluate(
-                f"Blazor._internal.navigationManager.navigateTo("
-                f"'{BASE}/installation-overview/{installation_id}', false)")
-            try:
-                self._page.wait_for_selector(
-                    ".device-summary-item", timeout=5_000)
-            except Exception:
-                time.sleep(0.5)
-            self._page.evaluate(
-                f"Blazor._internal.navigationManager.navigateTo("
-                f"'{BASE}/heat-pump-view/{heat_pump}', false)")
-            try:
-                self._page.wait_for_selector(
-                    ".co-gauge-container, .heat-pump-view-mode-container, "
-                    ".order-and-value-item",
-                    timeout=8_000)
-            except Exception:
-                pass
-            wait_ms = self._wait_for_data(timeout_ms=6_000)
-            log.debug("Data ready after %.0fms", wait_ms)
+            if installation_id and self._last_data.get(pid):
+                self._page.evaluate(
+                    f"Blazor._internal.navigationManager.navigateTo("
+                    f"'{BASE}/installation-overview/{installation_id}', false)")
+                try:
+                    self._page.wait_for_selector(".device-summary-item", timeout=5_000)
+                except Exception:
+                    time.sleep(0.5)
+                self._current_pump_id = None
+                self._navigate_to_pump(pid)
+
             snippet = self._page.evaluate(
                 "() => document.body.innerText.substring(0, 200)")
             if "403" in snippet or "must be connected" in snippet.lower():
@@ -587,38 +670,44 @@ class PolyconnectController:
             null_count = sum(1 for v in data.values() if v is None)
             if null_count >= 6:
                 log.warning(
-                    "get_status returned %d/11 null fields — DOM may not have rendered. "
+                    "get_status(%s) returned %d/11 null fields — DOM may not have rendered. "
                     "Page text: %s",
-                    null_count,
+                    pid, null_count,
                     self._page.evaluate("() => document.body.innerText.substring(0, 300)")[:200],
                 )
-            # ── staleness detection ──
-            if self._last_data is not None and data == self._last_data:
-                self._unchanged_count += 1
-                age = time.time() - self._last_change_ts
-                if (self._unchanged_count >= self._STALE_CALL_LIMIT
+            # ── per-pump staleness detection ──
+            prev = self._last_data.get(pid)
+            if prev is not None and data == prev:
+                self._unchanged_count[pid] = self._unchanged_count.get(pid, 0) + 1
+                age = time.time() - self._last_change_ts.get(pid, time.time())
+                if (self._unchanged_count[pid] >= self._STALE_CALL_LIMIT
                         or age >= self._STALE_TIME_LIMIT_S):
                     log.warning(
-                        "Status unchanged for %d calls / %.0fs — forcing page "
-                        "reload (suspect Blazor SignalR disconnect)",
-                        self._unchanged_count, age,
+                        "Pump %s status unchanged for %d calls / %.0fs — forcing reload "
+                        "(suspect Blazor SignalR disconnect)",
+                        pid, self._unchanged_count[pid], age,
                     )
                     self._load_app()
+                    self._navigate_to_pump(pid)
                     data = self._page.evaluate(_STATUS_JS)
-                    self._unchanged_count = 0
-                    self._last_change_ts  = time.time()
+                    self._unchanged_count[pid] = 0
+                    self._last_change_ts[pid] = time.time()
             else:
-                self._unchanged_count = 0
-                self._last_change_ts  = time.time()
-            self._last_data = data
+                self._unchanged_count[pid] = 0
+                self._last_change_ts[pid] = time.time()
+            self._last_data[pid] = data
             return data
 
     # ── set_mode ──────────────────────────────────────────────────────────────
 
-    def set_mode(self, mode: str) -> dict:
+    def set_mode(self, mode: str, pump_id: str | None = None) -> dict:
         with self._lock:
             self._ensure()
-            heat_pump = _get_heat_pump_id()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
+            heat_pump = pid
             page = self._page
             edit_url = (f"{BASE}/heat-pump-edit-mode/{heat_pump}"
                         if mode in MAIN_MODES
@@ -711,10 +800,13 @@ class PolyconnectController:
 
     # ── set_setpoint ──────────────────────────────────────────────────────────
 
-    def set_setpoint(self, temp: float) -> dict:
+    def set_setpoint(self, temp: float, pump_id: str | None = None) -> dict:
         with self._lock:
             self._ensure()
-            self._ensure_view()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
             page   = self._page
             target = int(temp)
 
@@ -820,9 +912,13 @@ class PolyconnectController:
         if result:
             log.info("Power clicked via JS fallback: %s", result)
 
-    def turn_on(self) -> dict:
+    def turn_on(self, pump_id: str | None = None) -> dict:
         with self._lock:
-            self._ensure(); self._ensure_view()
+            self._ensure()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
             is_on = self._get_active()
             if is_on is True:
                 return {"ok": True, "note": "already ON"}
@@ -830,9 +926,13 @@ class PolyconnectController:
             time.sleep(2.0)
             return {"ok": True}
 
-    def turn_off(self) -> dict:
+    def turn_off(self, pump_id: str | None = None) -> dict:
         with self._lock:
-            self._ensure(); self._ensure_view()
+            self._ensure()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
             is_on = self._get_active()
             if is_on is False:
                 return {"ok": True, "note": "already OFF"}
@@ -891,10 +991,10 @@ class PolyconnectController:
             except Exception:
                 page.evaluate("(s => { const b = document.querySelector(s); if (b) b.click(); })(" + repr(sel) + ")")
 
-    def _toggle_filtration(self, want_on: bool) -> dict:
+    def _toggle_filtration(self, want_on: bool, pump_id: str) -> dict:
         page = self._page
         installation_id = _get_installation_id()
-        heat_pump = _get_heat_pump_id()
+        heat_pump = pump_id
 
         result = self._scan_filtration_buttons()
         if result.get('found'):
@@ -933,15 +1033,23 @@ class PolyconnectController:
                 f"'{BASE}/heat-pump-view/{heat_pump}', false)")
             return {"ok": True, "note": "filtration button not found"}
 
-    def start_filtration(self) -> dict:
+    def start_filtration(self, pump_id: str | None = None) -> dict:
         with self._lock:
-            self._ensure(); self._ensure_view()
-            return self._toggle_filtration(want_on=True)
+            self._ensure()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
+            return self._toggle_filtration(want_on=True, pump_id=pid)
 
-    def stop_filtration(self) -> dict:
+    def stop_filtration(self, pump_id: str | None = None) -> dict:
         with self._lock:
-            self._ensure(); self._ensure_view()
-            return self._toggle_filtration(want_on=False)
+            self._ensure()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
+            return self._toggle_filtration(want_on=False, pump_id=pid)
 
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
@@ -957,6 +1065,8 @@ def _safe(fn, *a, **kw):
         msg = str(e).lower()
         if "expired" in msg or "refreshed" in msg or "recapture" in msg:
             return {"error": str(e), "auth_expired": True}, 401
+        if "unknown pump_id" in msg:
+            return {"error": str(e), "pump_not_found": True}, 404
         if "no session token" in msg or "no heat pump" in msg:
             return {"error": str(e), "credentials_missing": True}, 503
         return {"error": str(e)}, 500
@@ -985,8 +1095,75 @@ def health():
 
 @app.route("/status")
 def get_status():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.get_status)
+    """Legacy single-pump endpoint — aliases to the first discovered pump."""
+    data, code = _safe(ctrl._pw_thread.call, ctrl.get_status, None)
     return jsonify(data), code
+
+
+# ── Multi-pump routes (v2) ───────────────────────────────────────────────────
+
+@app.route("/pumps")
+def list_pumps():
+    """List all discovered heat pumps. Empty list if discovery hasn't run yet."""
+    return jsonify({"pumps": _get_pumps()})
+
+
+@app.route("/pumps/<pump_id>/status")
+def pump_status(pump_id: str):
+    data, code = _safe(ctrl._pw_thread.call, ctrl.get_status, pump_id)
+    return jsonify(data), code
+
+
+@app.route("/pumps/<pump_id>/setpoint", methods=["POST"])
+def pump_setpoint(pump_id: str):
+    temp = (request.get_json(silent=True) or {}).get("temperature")
+    if temp is None:
+        return jsonify({"error": "missing temperature"}), 400
+    try:
+        temp_f = float(temp)
+    except (TypeError, ValueError):
+        return jsonify({"error": "temperature must be a number"}), 400
+    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f, pump_id)
+    return jsonify(data), code
+
+
+@app.route("/pumps/<pump_id>/mode", methods=["POST"])
+@app.route("/pumps/<pump_id>/regulation_mode", methods=["POST"])
+def pump_mode(pump_id: str):
+    m = (request.get_json(silent=True) or {}).get("mode", "")
+    if not m:
+        return jsonify({"error": "missing mode"}), 400
+    if m not in (MAIN_MODES | REG_MODES):
+        return jsonify({"error": f"invalid mode: {m}"}), 400
+    data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m, pump_id)
+    return jsonify(data), code
+
+
+@app.route("/pumps/<pump_id>/on", methods=["POST"])
+def pump_on(pump_id: str):
+    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_on, pump_id)
+    return jsonify(data), code
+
+
+@app.route("/pumps/<pump_id>/off", methods=["POST"])
+def pump_off(pump_id: str):
+    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_off, pump_id)
+    return jsonify(data), code
+
+
+@app.route("/pumps/<pump_id>/filtration/start", methods=["POST"])
+def pump_filtration_start(pump_id: str):
+    data, code = _safe(ctrl._pw_thread.call, ctrl.start_filtration, pump_id)
+    return jsonify(data), code
+
+
+@app.route("/pumps/<pump_id>/filtration/stop", methods=["POST"])
+def pump_filtration_stop(pump_id: str):
+    data, code = _safe(ctrl._pw_thread.call, ctrl.stop_filtration, pump_id)
+    return jsonify(data), code
+
+
+# ── Legacy single-pump aliases (v1 / v2.0 compat — target first pump) ─────────
 
 
 @app.route("/debug/info-panel")
@@ -995,7 +1172,10 @@ def debug_info_panel():
     def _dump():
         with ctrl._lock:
             ctrl._ensure()
-            ctrl._ensure_view()
+            pid = _get_heat_pump_id()
+            if not pid:
+                return {"error": "no pump configured"}
+            ctrl._ensure_view(pid)
             time.sleep(1.0)
             clicked = ctrl._page.evaluate(_OPEN_INFO_PANEL_JS)
             if not clicked:
@@ -1033,8 +1213,10 @@ def debug_dom():
     def _dump():
         with ctrl._lock:
             ctrl._ensure()
-            ctrl._ensure_view()
             heat_pump = _get_heat_pump_id()
+            if not heat_pump:
+                return {"error": "no pump configured"}
+            ctrl._ensure_view(heat_pump)
             ctrl._page.evaluate(
                 f"Blazor._internal.navigationManager.navigateTo("
                 f"'{BASE}/heat-pump-view/{heat_pump}', false)")
@@ -1087,7 +1269,7 @@ def setpoint():
         temp_f = float(temp)
     except (TypeError, ValueError):
         return jsonify({"error": "temperature must be a number"}), 400
-    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f, None)
     return jsonify(data), code
 
 
@@ -1099,31 +1281,31 @@ def mode():
         return jsonify({"error": "missing mode"}), 400
     if m not in (MAIN_MODES | REG_MODES):
         return jsonify({"error": f"invalid mode: {m}"}), 400
-    data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m, None)
     return jsonify(data), code
 
 
 @app.route("/on", methods=["POST"])
 def turn_on():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_on)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_on, None)
     return jsonify(data), code
 
 
 @app.route("/off", methods=["POST"])
 def turn_off():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_off)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_off, None)
     return jsonify(data), code
 
 
 @app.route("/filtration/start", methods=["POST"])
 def filtration_start():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.start_filtration)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.start_filtration, None)
     return jsonify(data), code
 
 
 @app.route("/filtration/stop", methods=["POST"])
 def filtration_stop():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.stop_filtration)
+    data, code = _safe(ctrl._pw_thread.call, ctrl.stop_filtration, None)
     return jsonify(data), code
 
 
@@ -1235,9 +1417,10 @@ input:focus {{ outline:none; border-color:var(--accent); }}
             <span class="value {'ok' if creds.token else 'warn'}">{('Active (' + str(len(creds.token)) + ' chars, ' + age_disp + ')') if creds.token else 'Not acquired'}</span>
         </div>
         <div class="row">
-            <span class="label">Heat pump ID</span>
-            <span class="value {'ok' if creds.heat_pump_id else 'warn'}">{creds.heat_pump_id or 'Not set'}</span>
+            <span class="label">Heat pumps</span>
+            <span class="value {'ok' if creds.heat_pumps else 'warn'}">{(str(len(creds.heat_pumps)) + ' discovered') if creds.heat_pumps else 'Not discovered yet'}</span>
         </div>
+        {''.join(f'<div class="row"><span class="label">&nbsp;&nbsp;{p["name"]}</span><span class="value">{p["id"]}</span></div>' for p in creds.heat_pumps)}
         <div class="row">
             <span class="label">Installation ID</span>
             <span class="value {'ok' if creds.installation_id else 'warn'}">{creds.installation_id or 'Not set'}</span>
@@ -1254,8 +1437,9 @@ input:focus {{ outline:none; border-color:var(--accent); }}
         <h2>Credentials</h2>
         <p class="help">
             Login uses the same email/password as the official Polyconnect mobile app.
-            Credentials and IDs can also be set as add-on options (preferred) — the form
-            below updates them at runtime.
+            Credentials can also be set as add-on options (preferred). Heat pumps are
+            auto-discovered after login. Pin a single pump_id below only if discovery
+            picks something you do not want; leave blank to use the full discovered list.
         </p>
         <div id="err-banner" class="err-banner"></div>
         <form id="cred-form">
@@ -1263,8 +1447,8 @@ input:focus {{ outline:none; border-color:var(--accent); }}
             <input type="email" id="f-email" value="{email_disp}" autocomplete="username" required>
             <label>Password</label>
             <input type="password" id="f-password" autocomplete="current-password" required placeholder="Re-enter to update">
-            <label>Heat pump ID <span style="text-transform:none;">(24-char hex)</span></label>
-            <input type="text" id="f-heat-pump" value="{creds.heat_pump_id or ''}" pattern="[0-9a-f]{{24}}">
+            <label>Pin to single heat pump ID <span style="text-transform:none;">(optional, 24-char hex)</span></label>
+            <input type="text" id="f-heat-pump" value="{(creds.heat_pump_id if creds.heat_pumps and len(creds.heat_pumps) == 1 else '')}" pattern="[0-9a-f]{{24}}">
             <label>Installation ID <span style="text-transform:none;">(24-char hex, optional)</span></label>
             <input type="text" id="f-install" value="{creds.installation_id or ''}" pattern="[0-9a-f]{{24}}">
             <div style="margin-top:1rem;">
