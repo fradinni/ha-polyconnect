@@ -425,6 +425,23 @@ class AuthManager:
                 self._last_error = str(e)
                 return {"ok": False, "error": str(e)}
 
+    def set_ids(self, installation_id: str | None = None,
+                heat_pump_id: str | None = None) -> None:
+        """Persist discovered IDs without touching email/password/session.
+        Used by the Playwright-side auto-discovery."""
+        with self._lock:
+            changed = False
+            if installation_id and installation_id != self.credentials.installation_id:
+                self.credentials.installation_id = installation_id
+                changed = True
+            if heat_pump_id and heat_pump_id != self.credentials.heat_pump_id:
+                self.credentials.heat_pump_id = heat_pump_id
+                changed = True
+            if changed:
+                self._save_ids()
+                log.info("Persisted discovered IDs: installation=%s heat_pump=%s",
+                         self.credentials.installation_id, self.credentials.heat_pump_id)
+
     def reset_credentials(self) -> None:
         """Clear ALL persisted state. Forces a fresh terminal registration next time."""
         with self._lock:

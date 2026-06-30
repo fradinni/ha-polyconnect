@@ -12,7 +12,7 @@ Ports:
 """
 from __future__ import annotations
 
-import math, os, logging, queue, threading, time, json, sys
+import math, os, logging, queue, threading, time, json, sys, re
 from flask import Flask, jsonify, request, Response
 from pathlib import Path
 
@@ -54,6 +54,9 @@ UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
 
 MAIN_MODES = {"Chauffage", "Automatique", "Froid"}
 REG_MODES  = {"Eco", "Smart", "Boost"}
+
+# 24-char MongoDB ObjectId in Blazor SPA URLs (/installation-overview/<id>, /heat-pump-view/<id>)
+_OBJECTID_RE = re.compile(r"/([0-9a-f]{24})(?:/|$|\?)")
 
 # ── Status DOM extraction JS ──────────────────────────────────────────────────
 _STATUS_JS = """
@@ -314,11 +317,10 @@ class PolyconnectController:
     def _launch(self):
         from playwright.sync_api import sync_playwright
         token = _get_token()
-        heat_pump = _get_heat_pump_id()
         if not token:
             raise RuntimeError("No session token — configure POLYCONNECT_EMAIL / POLYCONNECT_PASSWORD")
-        if not heat_pump:
-            raise RuntimeError("No heat pump ID configured — set heat_pump_id in add-on options")
+        # Heat pump ID is allowed to be missing on first boot — _load_app will
+        # auto-discover it from the SPA. Same for installation_id.
 
         if self._pw:
             try: self._pw.stop()
@@ -371,6 +373,21 @@ class PolyconnectController:
             if not res.get("ok"):
                 raise RuntimeError(f"Session token expired and refresh failed: {res.get('error')}")
             raise RuntimeError("Session token expired — refreshed, will retry")
+
+        # ── First-boot ID discovery ───────────────────────────────────────────
+        # Without IDs we let the SPA route itself to its default landing page
+        # (/installation-overview/<id>), pluck the installation_id from the
+        # URL, then click the heat-pump card to land on /heat-pump-view/<id>.
+        if not heat_pump:
+            heat_pump = self._discover_ids()
+            if not heat_pump:
+                raise RuntimeError(
+                    "Could not auto-discover heat pump ID — "
+                    "set heat_pump_id in add-on options manually.")
+            # _discover_ids leaves the page on /heat-pump-view/<id> already,
+            # so the explicit navigateTo below is a no-op (same URL). Keeping
+            # it as the canonical entry path for the reload codepath.
+
         page.evaluate(
             f"Blazor._internal.navigationManager.navigateTo("
             f"'{BASE}/heat-pump-view/{heat_pump}', false)")
@@ -391,6 +408,68 @@ class PolyconnectController:
                 raise RuntimeError(f"Session token expired and refresh failed: {res.get('error')}")
             raise RuntimeError("Session token expired — refreshed, will retry")
         log.info("Browser launched and heat pump view loaded")
+
+    def _discover_ids(self) -> str | None:
+        """Auto-discover installation_id + heat_pump_id from the Blazor SPA.
+
+        Strategy (verified empirically — see docs/native-login.md §8):
+          1. /from-native/<token> already loaded; SPA auto-routes to its
+             default landing page = /installation-overview/<installation_id>.
+          2. Pluck installation_id from the URL.
+          3. Click .device-summary-item.mobile-clickable → SPA navigates to
+             /heat-pump-view/<heat_pump_id>. Pluck the ID and return it.
+
+        For multi-heat-pump installations the FIRST card wins. v2 single-device
+        parity; multi-device support can pick by name later.
+        Returns heat_pump_id on success, None on failure.
+        """
+        page = self._page
+        log.info("Discovering installation / heat-pump IDs from SPA …")
+
+        # Wait for the SPA's default route — it lands on /installation-overview/<id>
+        try:
+            page.wait_for_function(
+                f"() => /\\/installation-overview\\/[0-9a-f]{{24}}/.test(window.location.pathname)"
+                f" || /\\/heat-pump-view\\/[0-9a-f]{{24}}/.test(window.location.pathname)",
+                timeout=15_000)
+        except Exception:
+            log.warning("SPA did not auto-route to a known view (url=%s)", page.url)
+
+        m = _OBJECTID_RE.search(page.url)
+        installation_id = m.group(1) if m and "installation-overview" in page.url else None
+        heat_pump_id = m.group(1) if m and "heat-pump-view" in page.url else None
+
+        # If we landed on heat-pump-view straight away (deep link / single-device
+        # shortcut), we already have heat_pump_id — done.
+        if heat_pump_id:
+            _auth_mgr.set_ids(installation_id=installation_id, heat_pump_id=heat_pump_id)
+            log.info("Discovered (deep-link) heat_pump_id=%s", heat_pump_id)
+            return heat_pump_id
+
+        if not installation_id:
+            log.error("Could not find installation_id in landing URL: %s", page.url)
+            return None
+        log.info("Discovered installation_id=%s", installation_id)
+
+        # Click the first heat-pump card to navigate to /heat-pump-view/<id>
+        try:
+            page.wait_for_selector(".device-summary-item.mobile-clickable", timeout=10_000)
+            page.click(".device-summary-item.mobile-clickable")
+            page.wait_for_function(
+                f"() => /\\/heat-pump-view\\/[0-9a-f]{{24}}/.test(window.location.pathname)",
+                timeout=10_000)
+        except Exception as e:
+            log.error("Could not click heat-pump card / navigate: %s", e)
+            return None
+
+        m = _OBJECTID_RE.search(page.url)
+        if not m:
+            log.error("No heat_pump_id in URL after click: %s", page.url)
+            return None
+        heat_pump_id = m.group(1)
+        _auth_mgr.set_ids(installation_id=installation_id, heat_pump_id=heat_pump_id)
+        log.info("Discovered heat_pump_id=%s", heat_pump_id)
+        return heat_pump_id
 
     def _ensure(self):
         if self._browser and self._browser.is_connected():

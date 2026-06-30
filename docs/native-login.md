@@ -336,8 +336,14 @@ Persistent state in `/data/` becomes:
 Re-auth happens on any 401/403 from the Blazor app; we silently re-run `Login`
 with the stored credentials (the terminal stays registered).
 
-`installation_id` and `heat_pump_id` discovery moves into a "discover" routine
-that runs once on first login: Playwright loads `<url>/<token>`, navigates
-through the SPA, captures the IDs from the URL path. After that, the IDs stay
-in `/data/ids.json` and we never need them re-discovered unless the user adds
-a new heat pump.
+`installation_id` and `heat_pump_id` discovery is **automatic on first boot**.
+After `auth.py` completes login, the Playwright controller in `server.py`
+loads `<url>/<token>`, lets the Blazor SPA auto-route to its default landing
+page (`/installation-overview/<installation_id>`), plucks the installation
+ID from the URL, clicks the `.device-summary-item.mobile-clickable` card,
+and reads the resulting `/heat-pump-view/<heat_pump_id>` URL. Both IDs are
+persisted to `/data/ids.json`; subsequent boots skip discovery entirely.
+
+Multi-heat-pump installations currently take the first card (single-device
+parity with v1). Picking by name is a one-line change in `_discover_ids()`
+when needed.
