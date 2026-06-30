@@ -24,7 +24,7 @@ Health check — always responds, even without credentials.
 {
   "ok": true,
   "service": "polyconnect-bridge",
-  "version": "2.0.0",
+  "version": "1.0.6",
   "credentials_configured": true,
   "capture_phase": "idle"
 }
@@ -51,8 +51,9 @@ Returns the current heat pump state by scraping the Blazor DOM.
   "operatingMode": "Chauffage",
   "regulationMode": "Smart",
   "heatPumpActive": true,
-  "compressorRunning": true,
+  "fanRunning": true,
   "filtrationRunning": false,
+  "defrostActive": false,
   "alarmActive": false,
   "alarmMessage": null,
   "errorCode": 0
@@ -61,14 +62,15 @@ Returns the current heat pump state by scraping the Blazor DOM.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `waterTemperature` | float\|null | Pool water temperature (°C) |
+| `waterTemperature` | float\|null | Pool water temperature (°C) — null when circulation pump is off |
 | `outsideTemperature` | float\|null | Ambient/outside temperature (°C) |
 | `setpointTemperature` | float\|null | Target temperature (°C), range 8–32 |
 | `operatingMode` | string\|null | `Chauffage`, `Froid`, `Automatique` |
 | `regulationMode` | string\|null | `Eco`, `Smart`, `Boost`, or null |
 | `heatPumpActive` | bool\|null | Whether the heat pump is powered on |
-| `compressorRunning` | bool | Whether the compressor is currently running |
+| `fanRunning` | bool | Whether the fan is currently running |
 | `filtrationRunning` | bool | Whether the filtration pump is running |
+| `defrostActive` | bool | Whether a defrost cycle is active |
 | `alarmActive` | bool | Whether an alarm condition exists |
 | `alarmMessage` | string\|null | Alarm text (French), null if no alarm |
 | `errorCode` | int | 0 = no error, 1 = alarm active |

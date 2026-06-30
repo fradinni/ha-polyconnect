@@ -4,8 +4,8 @@
   "version": "1.0.2",
   "codeowners": [],
   "config_flow": true,
-  "documentation": "https://github.com/your-user/ha-polyconnect",
-  "issue_tracker": "https://github.com/your-user/ha-polyconnect/issues",
+  "documentation": "https://github.com/fradinni/ha-polyconnect",
+  "issue_tracker": "https://github.com/fradinni/ha-polyconnect/issues",
   "integration_type": "device",
   "iot_class": "local_polling",
   "requirements": []
