@@ -19,7 +19,7 @@ from pathlib import Path
 
 from capture_manager import CaptureManager, DATA_DIR
 
-BRIDGE_VERSION = "1.0.5"
+BRIDGE_VERSION = "1.0.6"
 
 # ── Credential loading (from /data/ persistent storage) ───────────────────────
 
@@ -179,16 +179,16 @@ _STATUS_JS = """
         else if (/\\bOFF\\b/.test(body)) heatPumpActive = false;
     }
 
-    // Compressor (Forçage pompe — active when list item does NOT have state-disabled)
-    let compressorRunning = false;
-    const compItem = document.querySelector('.istd-ct-list-item:has(.device-ico-water-pump)');
-    if (compItem) {
-        compressorRunning = !compItem.classList.contains('state-disabled');
+    // Fan / pump forcing (Forçage pompe — active when list item does NOT have state-disabled)
+    let fanRunning = false;
+    const fanItem = document.querySelector('.istd-ct-list-item:has(.device-ico-water-pump)');
+    if (fanItem) {
+        fanRunning = !fanItem.classList.contains('state-disabled');
     } else {
         const body = document.body.innerText.toLowerCase();
         if (body.includes('compresseur') &&
             (body.includes('en marche') || body.includes('actif') || body.includes(' on')))
-            compressorRunning = true;
+            fanRunning = true;
     }
 
     // Filtration (active when list item does NOT have state-disabled)
@@ -202,6 +202,11 @@ _STATUS_JS = """
             (body.includes(' on') || body.includes('démarr') || body.includes('en marche') || body.includes('actif')))
             filtrationRunning = true;
     }
+
+    // Defrost / Dégivrage (active when list item does NOT have state-disabled)
+    let defrostActive = false;
+    const defrostItem = document.querySelector('.istd-ct-list-item:has(.device-ico-defrosting)');
+    if (defrostItem) defrostActive = !defrostItem.classList.contains('state-disabled');
 
     // Alarm
     let alarmActive = false, alarmMessage = null;
@@ -227,8 +232,9 @@ _STATUS_JS = """
         operatingMode:       operatingMode,
         regulationMode:      regulationMode,
         heatPumpActive:      heatPumpActive,
-        compressorRunning:   compressorRunning,
+        fanRunning:          fanRunning,
         filtrationRunning:   filtrationRunning,
+        defrostActive:       defrostActive,
         alarmActive:         alarmActive,
         alarmMessage:        alarmMessage,
         errorCode:           alarmActive ? 1 : 0,

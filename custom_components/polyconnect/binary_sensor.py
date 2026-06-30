@@ -24,18 +24,11 @@ class PolyconnectBinarySensorDescription(BinarySensorEntityDescription):
 
 BINARY_SENSORS: tuple[PolyconnectBinarySensorDescription, ...] = (
     PolyconnectBinarySensorDescription(
-        key="compressor_running",
-        data_key="compressorRunning",
-        name="Compressor",
+        key="fan_running",
+        data_key="fanRunning",
+        name="Fan",
         device_class=BinarySensorDeviceClass.RUNNING,
-        icon="mdi:heat-pump",
-    ),
-    PolyconnectBinarySensorDescription(
-        key="alarm_active",
-        data_key="alarmActive",
-        name="Alarm",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:alert-circle",
+        icon="mdi:fan",
     ),
     PolyconnectBinarySensorDescription(
         key="filtration_running",
@@ -43,6 +36,20 @@ BINARY_SENSORS: tuple[PolyconnectBinarySensorDescription, ...] = (
         name="Filtration Pump",
         device_class=BinarySensorDeviceClass.RUNNING,
         icon="mdi:pump",
+    ),
+    PolyconnectBinarySensorDescription(
+        key="defrost_active",
+        data_key="defrostActive",
+        name="Defrost",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        icon="mdi:snowflake-melt",
+    ),
+    PolyconnectBinarySensorDescription(
+        key="alarm_active",
+        data_key="alarmActive",
+        name="Alarm",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        icon="mdi:alert-circle",
     ),
 )
 
