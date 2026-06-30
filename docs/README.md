@@ -17,8 +17,8 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 │   │  Integration         │◄──────►│  (Flask + Playwright)        │  │
 │   │                     │        │                              │  │
 │   │  • Climate entity   │        │  • Headless Chromium         │  │
-│   │  • 8 Sensors        │        │  • DOM scraping (status)     │  │
-│   │  • 3 Binary sensors │        │  • Simulated clicks (cmds)   │  │
+│   │  • 6 Sensors        │        │  • DOM scraping (status)     │  │
+│   │  • 4 Binary sensors │        │  • Simulated clicks (cmds)   │  │
 │   │  • 1 Switch         │        │  • Credential capture (MITM) │  │
 │   └─────────────────────┘        └───────────────┬──────────────┘  │
 │                                                   │                 │
@@ -57,18 +57,21 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 | `switch.py` | Power on/off switch |
 | `const.py` | All constants, mode mappings |
 
-**Version:** 2.0.0 · **IoT class:** `local_polling` · **Platforms:** sensor, climate, binary_sensor, switch
+**Version:** 1.0.2 · **IoT class:** `local_polling` · **Platforms:** sensor, climate, binary_sensor, switch
 
 ### Bridge Add-on (`polyconnect_bridge/`)
 
 | File | Purpose |
 |------|---------|
 | `server.py` | Flask REST API + Playwright controller + ingress panel |
+| `capture_manager.py` | Credential capture lifecycle (mitmproxy orchestration) |
+| `setup_ui.py` | Phone-facing setup wizard served on port 8080 during capture |
+| `mitm_addon.py` | mitmproxy addon that intercepts and extracts the session token |
 | `config.yaml` | Add-on manifest (ports, schema, ingress) |
 | `Dockerfile` | Debian + Chromium + Python |
 | `run.sh` | Startup script |
 
-**Version:** 2.0.3 · **Ports:** 8765 (API/ingress), 8080 (phone setup UI), 8888 (MITM proxy)
+**Version:** 1.0.6 · **Ports:** 8765 (API/ingress), 8080 (phone setup UI), 8888 (MITM proxy)
 
 ---
 
@@ -94,8 +97,6 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 | Water Temperature | `waterTemperature` | °C | temperature |
 | Outside Temperature | `outsideTemperature` | °C | temperature |
 | Setpoint Temperature | `setpointTemperature` | °C | temperature |
-| Power Consumption | `powerConsumptionW` | W | power |
-| Coefficient of Performance | `cop` | — | — |
 | Operating Mode | `operatingMode` | — | — |
 | Regulation Mode | `regulationMode` | — | — |
 | Alarm Message | `alarmMessage` | — | — |
@@ -104,9 +105,10 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 
 | Entity | Data Key | Device Class |
 |--------|----------|--------------|
-| Compressor | `compressorRunning` | running |
-| Alarm | `alarmActive` | problem |
+| Fan | `fanRunning` | running |
 | Filtration Pump | `filtrationRunning` | running |
+| Defrost | `defrostActive` | running |
+| Alarm | `alarmActive` | problem |
 
 ### Switch
 
@@ -143,7 +145,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 
 | Option | Default | Range | Description |
 |--------|---------|-------|-------------|
-| Scan interval | 60s | 10–3600s | How often to poll the bridge for status |
+| Scan interval | 1 min | 1–60 min | How often to poll the bridge for status |
 
 ---
 

@@ -64,6 +64,9 @@ ha-polyconnect/
 ├── polyconnect_bridge/              # Local HA add-on (Flask + Playwright)
 │   ├── config.yaml                  # Add-on manifest (version, schema, ports)
 │   ├── server.py                    # REST bridge wrapping Playwright sync API
+│   ├── capture_manager.py           # Credential capture lifecycle (mitmproxy orchestration)
+│   ├── setup_ui.py                  # Phone-facing setup wizard (port 8080, during capture)
+│   ├── mitm_addon.py                # mitmproxy addon — intercepts and extracts session token
 │   ├── Dockerfile
 │   ├── requirements.txt             # flask, playwright
 │   └── run.sh
