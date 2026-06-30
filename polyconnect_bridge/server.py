@@ -19,7 +19,7 @@ from pathlib import Path
 
 from capture_manager import CaptureManager, DATA_DIR
 
-BRIDGE_VERSION = "1.0.4"
+BRIDGE_VERSION = "1.0.5"
 
 # ── Credential loading (from /data/ persistent storage) ───────────────────────
 
@@ -179,35 +179,27 @@ _STATUS_JS = """
         else if (/\\bOFF\\b/.test(body)) heatPumpActive = false;
     }
 
-    // Compressor
+    // Compressor (Forçage pompe — active when list item does NOT have state-disabled)
     let compressorRunning = false;
-    const compEl = document.querySelector('[class*="compressor"], [class*="compresseur"]');
-    if (compEl) compressorRunning = compEl.classList.contains('running') || compEl.classList.contains('active');
-    if (!compressorRunning) {
+    const compItem = document.querySelector('.istd-ct-list-item:has(.device-ico-water-pump)');
+    if (compItem) {
+        compressorRunning = !compItem.classList.contains('state-disabled');
+    } else {
         const body = document.body.innerText.toLowerCase();
-        if (body.includes('compresseur') && body.includes('en marche')) compressorRunning = true;
+        if (body.includes('compresseur') &&
+            (body.includes('en marche') || body.includes('actif') || body.includes(' on')))
+            compressorRunning = true;
     }
 
-    // Filtration
+    // Filtration (active when list item does NOT have state-disabled)
     let filtrationRunning = false;
-    const filtSelectors = [
-        '[class*="filtration"] button', '[class*="filtration"][class*="toggle"]',
-        '[class*="filtration"][class*="btn"]', '[class*="pompe-filtration"]', '[class*="pump-status"]',
-    ];
-    for (const sel of filtSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-            const p = el.getAttribute('aria-pressed');
-            if (p !== null) { filtrationRunning = p === 'true'; break; }
-            if (el.classList.contains('istd-sty-active') || el.classList.contains('active') ||
-                el.classList.contains('on') || el.classList.contains('running')) {
-                filtrationRunning = true; break;
-            }
-        }
-    }
-    if (!filtrationRunning) {
+    const filtItem = document.querySelector('.istd-ct-list-item:has(.device-ico-flowing)');
+    if (filtItem) {
+        filtrationRunning = !filtItem.classList.contains('state-disabled');
+    } else {
         const body = document.body.innerText.toLowerCase();
-        if (body.includes('filtration') && (body.includes(' on') || body.includes('démarr')))
+        if ((body.includes('filtration') || body.includes('pompe')) &&
+            (body.includes(' on') || body.includes('démarr') || body.includes('en marche') || body.includes('actif')))
             filtrationRunning = true;
     }
 
@@ -243,6 +235,19 @@ _STATUS_JS = """
     };
 }
 """
+
+# ── Info panel opener JS ──────────────────────────────────────────────────────
+# Compressor/filtration status is hidden behind an info icon next to the
+# temperature slider — click it so _STATUS_JS can see the panel content.
+# ponytail: broad selector list; tighten once actual class names are known.
+_OPEN_INFO_PANEL_JS = """() => {
+    const icon = document.querySelector('[class*="istd-std-icon-info"]');
+    if (icon) {
+        const btn = icon.closest('button');
+        if (btn && btn.offsetParent !== null) { btn.click(); return 'istd-std-icon-info'; }
+    }
+    return null;
+}"""
 
 # ── Dedicated Playwright thread ────────────────────────────────────────────────
 
@@ -282,6 +287,14 @@ class PlaywrightThread:
 class PolyconnectController:
     """Single persistent Chromium instance, serialised by a threading lock."""
 
+    # Staleness detection — Blazor's SignalR can disconnect silently while the
+    # DOM keeps showing the last known values. Force a page reload when the
+    # status payload hasn't changed across N consecutive calls OR for T seconds
+    # (whichever fires first). Catches the "HA stops updating, no errors,
+    # only a bridge restart fixes it" failure mode.
+    _STALE_CALL_LIMIT   = 10           # consecutive identical reads
+    _STALE_TIME_LIMIT_S = 30 * 60      # absolute wall-clock cap
+
     def __init__(self):
         self._pw_thread = PlaywrightThread()
         self._lock   = threading.Lock()
@@ -289,6 +302,9 @@ class PolyconnectController:
         self._browser= None
         self._ctx    = None
         self._page   = None
+        self._last_data: dict | None = None
+        self._last_change_ts: float  = time.time()
+        self._unchanged_count: int   = 0
 
     def _launch(self):
         from playwright.sync_api import sync_playwright
@@ -311,7 +327,19 @@ class PolyconnectController:
             viewport={"width": 390, "height": 844}, locale="fr-FR")
         self._ctx.add_cookies([AFFINITY])
         self._page    = self._ctx.new_page()
-        self._load_app()
+        try:
+            self._load_app()
+        except Exception:
+            # Clean up so _ensure() forces a fresh relaunch next call
+            try:
+                self._browser.close()
+                self._pw.stop()
+            except Exception:
+                pass
+            self._browser = None
+            self._pw      = None
+            self._page    = None
+            raise
 
     def _load_app(self):
         token = _get_token()
@@ -447,7 +475,20 @@ class PolyconnectController:
                 self._pw      = None
                 self._page    = None
                 raise RuntimeError("Session token expired — recapture needed")
+            # Open the info panel to expose compressor / filtration status
+            _info_sel = self._page.evaluate(_OPEN_INFO_PANEL_JS)
+            if _info_sel:
+                try:
+                    self._page.wait_for_selector('.heat-pump-info-modal', timeout=2_000)
+                except Exception:
+                    pass  # panel didn't appear; _STATUS_JS falls back to text detection
+                log.debug("Opened info panel via: %s", _info_sel)
             data = self._page.evaluate(_STATUS_JS)
+            if _info_sel:
+                try:
+                    self._page.keyboard.press('Escape')
+                except Exception:
+                    pass
             null_count = sum(1 for v in data.values() if v is None)
             if null_count >= 6:
                 log.warning(
@@ -456,6 +497,25 @@ class PolyconnectController:
                     null_count,
                     self._page.evaluate("() => document.body.innerText.substring(0, 300)")[:200],
                 )
+            # ── staleness detection ──
+            if self._last_data is not None and data == self._last_data:
+                self._unchanged_count += 1
+                age = time.time() - self._last_change_ts
+                if (self._unchanged_count >= self._STALE_CALL_LIMIT
+                        or age >= self._STALE_TIME_LIMIT_S):
+                    log.warning(
+                        "Status unchanged for %d calls / %.0fs — forcing page "
+                        "reload (suspect Blazor SignalR disconnect)",
+                        self._unchanged_count, age,
+                    )
+                    self._load_app()
+                    data = self._page.evaluate(_STATUS_JS)
+                    self._unchanged_count = 0
+                    self._last_change_ts  = time.time()
+            else:
+                self._unchanged_count = 0
+                self._last_change_ts  = time.time()
+            self._last_data = data
             return data
 
     # ── set_mode ──────────────────────────────────────────────────────────────
@@ -828,6 +888,44 @@ def health():
 @app.route("/status")
 def get_status():
     data, code = _safe(ctrl._pw_thread.call, ctrl.get_status)
+    return jsonify(data), code
+
+
+@app.route("/debug/info-panel")
+def debug_info_panel():
+    """Click the info icon, wait for panel, dump its content."""
+    def _dump():
+        with ctrl._lock:
+            ctrl._ensure()
+            ctrl._ensure_view()
+            time.sleep(1.0)
+            clicked = ctrl._page.evaluate(_OPEN_INFO_PANEL_JS)
+            if not clicked:
+                return {"error": "info button not found", "clicked": False}
+            time.sleep(1.5)
+            result = ctrl._page.evaluate("""() => {
+                const modal = document.querySelector('.heat-pump-info-modal');
+                const listItems = Array.from(document.querySelectorAll('.istd-ct-list-item')).map(el => ({
+                    outerHTML: el.outerHTML.substring(0, 2000),
+                    text: el.textContent.trim(),
+                    classes: el.className,
+                    children: Array.from(el.querySelectorAll('*')).map(c => ({
+                        tag: c.tagName,
+                        classes: c.className,
+                        text: c.textContent.trim().substring(0, 50),
+                        visible: c.offsetParent !== null,
+                    })),
+                }));
+                return {
+                    modalHTML: modal ? modal.innerHTML.substring(0, 6000) : null,
+                    listItems,
+                    bodyText: document.body.innerText.substring(0, 2000),
+                };
+            }""")
+            ctrl._page.keyboard.press('Escape')
+            result["clicked"] = clicked
+            return result
+    data, code = _safe(ctrl._pw_thread.call, _dump)
     return jsonify(data), code
 
 
