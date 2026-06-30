@@ -1,4 +1,7 @@
-"""Binary sensor platform for Polyconnect — running states and alarm."""
+"""Binary sensor platform for Polyconnect — running states and alarm.
+
+One binary sensor of each kind per discovered heat pump.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -61,7 +64,9 @@ async def async_setup_entry(
 ) -> None:
     coordinator: PolyconnectCoordinator = entry.runtime_data
     async_add_entities(
-        PolyconnectBinarySensor(coordinator, desc) for desc in BINARY_SENSORS
+        PolyconnectBinarySensor(coordinator, pump["id"], pump["name"], desc)
+        for pump in coordinator.pumps
+        for desc in BINARY_SENSORS
     )
 
 
@@ -71,13 +76,16 @@ class PolyconnectBinarySensor(PolyconnectEntity, BinarySensorEntity):
     def __init__(
         self,
         coordinator: PolyconnectCoordinator,
+        pump_id: str,
+        pump_name: str,
         description: PolyconnectBinarySensorDescription,
     ) -> None:
-        super().__init__(coordinator, description.key)
+        super().__init__(coordinator, pump_id, pump_name, description.key)
         self.entity_description = description
 
     @property
     def is_on(self) -> bool | None:
-        if not self.coordinator.data:
+        data = self._pump_data
+        if not data:
             return None
-        return bool(self.coordinator.data.get(self.entity_description.data_key))
+        return bool(data.get(self.entity_description.data_key))

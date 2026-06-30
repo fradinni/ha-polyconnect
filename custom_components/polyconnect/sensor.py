@@ -1,4 +1,7 @@
-"""Sensor platform for Polyconnect — temperature, mode, and status sensors."""
+"""Sensor platform for Polyconnect — temperature, mode, and status sensors.
+
+One sensor of each kind per discovered heat pump.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -81,10 +84,12 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Polyconnect sensor entities."""
+    """Set up Polyconnect sensor entities — one of each per discovered pump."""
     coordinator: PolyconnectCoordinator = entry.runtime_data
     async_add_entities(
-        PolyconnectSensor(coordinator, description) for description in SENSORS
+        PolyconnectSensor(coordinator, pump["id"], pump["name"], desc)
+        for pump in coordinator.pumps
+        for desc in SENSORS
     )
 
 
@@ -94,13 +99,16 @@ class PolyconnectSensor(PolyconnectEntity, SensorEntity):
     def __init__(
         self,
         coordinator: PolyconnectCoordinator,
+        pump_id: str,
+        pump_name: str,
         description: PolyconnectSensorDescription,
     ) -> None:
-        super().__init__(coordinator, description.key)
+        super().__init__(coordinator, pump_id, pump_name, description.key)
         self.entity_description = description
 
     @property
     def native_value(self) -> float | str | None:
-        if not self.coordinator.data:
+        data = self._pump_data
+        if not data:
             return None
-        return self.coordinator.data.get(self.entity_description.data_key)
+        return data.get(self.entity_description.data_key)

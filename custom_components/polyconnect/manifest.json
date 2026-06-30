@@ -1,7 +1,7 @@
 {
   "domain": "polyconnect",
   "name": "Polyconnect",
-  "version": "1.0.2",
+  "version": "2.1.0",
   "codeowners": [],
   "config_flow": true,
   "documentation": "https://github.com/fradinni/ha-polyconnect",
