@@ -102,10 +102,17 @@ class PolyconnectAPI:
 
     # ── Pump discovery ───────────────────────────────────────────────────────
 
-    async def get_pumps(self) -> list[dict[str, Any]]:
-        """Return the list of discovered heat pumps. Each item: {id, name}."""
-        data = await self._get("/pumps")
-        return data.get("pumps", [])
+    async def get_pumps(self) -> dict[str, Any]:
+        """Return the full pump listing.
+
+        Response shape (bridge v2.2+):
+            {"pumps": [{"id": ..., "name": ...}, ...],
+             "installation_id": "...",
+             "installation_name": "..."}
+
+        Older bridges return just `{"pumps": [...]}` — callers should treat
+        installation_id / installation_name as optional."""
+        return await self._get("/pumps")
 
     # ── Per-pump device control (v2.1+) ──────────────────────────────────────
 

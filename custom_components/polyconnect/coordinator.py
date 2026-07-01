@@ -36,10 +36,12 @@ class PolyconnectCoordinator(DataUpdateCoordinator):
     """
 
     pumps: list[dict[str, Any]]
+    installation_name: str | None
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.api = PolyconnectAPI(bridge_url=entry.data[CONF_BRIDGE_URL])
         self.pumps = []
+        self.installation_name = None
         scan_interval = entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL)
         super().__init__(
             hass, LOGGER, name=DOMAIN,
@@ -52,15 +54,20 @@ class PolyconnectCoordinator(DataUpdateCoordinator):
             return None
         return self.data.get(pump_id)
 
+    def _apply_pumps_response(self, resp: dict[str, Any]) -> None:
+        """Cache the /pumps response — pumps list + installation metadata."""
+        self.pumps = resp.get("pumps", [])
+        self.installation_name = resp.get("installation_name") or None
+
     async def async_discover_pumps(self) -> list[dict[str, Any]]:
         """Hit /pumps on the bridge and cache the result. Called at setup."""
-        self.pumps = await self.api.get_pumps()
+        self._apply_pumps_response(await self.api.get_pumps())
         return self.pumps
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         try:
             # Refresh the pump list cheaply; new pumps surface here.
-            self.pumps = await self.api.get_pumps()
+            self._apply_pumps_response(await self.api.get_pumps())
             if not self.pumps:
                 raise UpdateFailed(
                     "Bridge has no heat pumps yet — first-boot discovery may "

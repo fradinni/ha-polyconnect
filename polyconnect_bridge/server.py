@@ -410,6 +410,16 @@ class PolyconnectController:
                 raise RuntimeError(
                     "Could not auto-discover any heat pumps — "
                     "check that the account has at least one configured pump.")
+        elif not _auth_mgr.credentials.installation_name and _auth_mgr.credentials.installation_id:
+            # Pumps already known (env-var pin or existing ids.json without a name).
+            # Take a detour through /pools-overview to grab the installation name;
+            # the subsequent _navigate_to_pump() call takes us back to the pump view.
+            name = self._scrape_installation_name(_auth_mgr.credentials.installation_id)
+            if name:
+                _auth_mgr.set_pumps(
+                    installation_id=_auth_mgr.credentials.installation_id,
+                    installation_name=name,
+                    heat_pumps=pumps)
 
         # Navigate to the default (first) pump's view.
         default_pump = pumps[0]["id"]
@@ -448,6 +458,69 @@ class PolyconnectController:
             pass
         self._wait_for_data(timeout_ms=10_000)
         self._current_pump_id = pump_id
+
+    def _scrape_installation_name(self, installation_id: str | None = None) -> str | None:
+        """Navigate to /pools-overview and read `.pool-component-installation-name`
+        cards to resolve the installation name.
+
+        - Single-pool account → returns the only name.
+        - Multi-pool + installation_id given → clicks each card, matches the one
+          whose click lands on /installation-overview/<installation_id>.
+        - Multi-pool + no installation_id → returns the first card's name.
+
+        Leaves the browser on /pools-overview (or wherever the last click sent
+        it). Callers must re-navigate. Never throws — returns None on failure."""
+        page = self._page
+        try:
+            page.evaluate(
+                f"Blazor._internal.navigationManager.navigateTo("
+                f"'{BASE}/pools-overview', false)")
+            try:
+                page.wait_for_selector(".pool-component-installation-name", timeout=10_000)
+            except Exception:
+                log.warning("/pools-overview did not render pool cards (url=%s)", page.url)
+                return None
+            names = page.evaluate("""() => Array.from(
+                document.querySelectorAll('.pool-component-installation-name')
+            ).map(el => (el.textContent || '').trim()).filter(Boolean)""")
+            if not names:
+                log.warning("/pools-overview rendered but no installation names found")
+                return None
+            log.info("Found %d installation(s) on /pools-overview: %s", len(names), names)
+
+            if len(names) == 1 or not installation_id:
+                return names[0]
+
+            # Multi-pool account: click each card, capture the landing URL,
+            # return the one matching installation_id.
+            for i, candidate in enumerate(names):
+                try:
+                    if i > 0:
+                        page.evaluate(
+                            f"Blazor._internal.navigationManager.navigateTo("
+                            f"'{BASE}/pools-overview', false)")
+                        page.wait_for_selector(
+                            ".pool-component-installation-name", timeout=8_000)
+                    page.eval_on_selector_all(
+                        ".pool-component-installation-name",
+                        f"(els) => els[{i}] && els[{i}].click()")
+                    page.wait_for_function(
+                        "() => /\\/installation-overview\\/[0-9a-f]{24}/"
+                        ".test(window.location.pathname)",
+                        timeout=6_000)
+                    m = _OBJECTID_RE.search(page.url or "")
+                    if m and m.group(1) == installation_id:
+                        log.info("Matched installation_id=%s -> %r",
+                                 installation_id, candidate)
+                        return candidate
+                except Exception as e:
+                    log.debug("Card %d (%r) click failed: %s", i, candidate, e)
+            log.warning("Could not match installation_id=%s in %d pool(s); "
+                        "returning first name", installation_id, len(names))
+            return names[0]
+        except Exception as e:
+            log.warning("pools-overview scrape failed: %s", e)
+            return None
 
     def _discover_ids(self) -> list[dict]:
         """Auto-discover installation_id + the full list of heat pumps from the SPA.
@@ -494,6 +567,21 @@ class PolyconnectController:
             return []
         installation_id = m.group(1)
         log.info("Discovered installation_id=%s", installation_id)
+
+        # Installation name lives on /pools-overview. The scrape navigates away —
+        # we come back to /installation-overview/<id> for pump enumeration below.
+        installation_name = self._scrape_installation_name(installation_id)
+        if installation_name:
+            page.evaluate(
+                f"Blazor._internal.navigationManager.navigateTo("
+                f"'{BASE}/installation-overview/{installation_id}', false)")
+            try:
+                page.wait_for_function(
+                    f"() => /\\/installation-overview\\/{installation_id}/"
+                    ".test(window.location.pathname)",
+                    timeout=8_000)
+            except Exception:
+                pass
 
         # Enumerate cards. We read names BEFORE clicking — once we click,
         # the SPA navigates away and the cards detach. The list order matches
@@ -563,7 +651,9 @@ class PolyconnectController:
             log.error("Discovered no pumps despite finding %d card(s)", len(card_names))
             return []
 
-        _auth_mgr.set_pumps(installation_id=installation_id, heat_pumps=pumps)
+        _auth_mgr.set_pumps(installation_id=installation_id,
+                            installation_name=installation_name,
+                            heat_pumps=pumps)
         return pumps
 
     def _ensure(self):
@@ -1105,7 +1195,12 @@ def get_status():
 @app.route("/pumps")
 def list_pumps():
     """List all discovered heat pumps. Empty list if discovery hasn't run yet."""
-    return jsonify({"pumps": _get_pumps()})
+    creds = _auth_mgr.credentials
+    return jsonify({
+        "pumps": _get_pumps(),
+        "installation_id": creds.installation_id,
+        "installation_name": creds.installation_name,
+    })
 
 
 @app.route("/pumps/<pump_id>/status")
@@ -1203,6 +1298,55 @@ def debug_info_panel():
             ctrl._page.keyboard.press('Escape')
             result["clicked"] = clicked
             return result
+    data, code = _safe(ctrl._pw_thread.call, _dump)
+    return jsonify(data), code
+
+
+@app.route("/debug/installation-overview")
+def debug_installation_overview():
+    """TEMP probe — dump candidate installation-name selectors."""
+    def _dump():
+        with ctrl._lock:
+            ctrl._ensure()
+            inst = _get_installation_id()
+            if not inst:
+                return {"error": "no installation_id known"}
+            ctrl._page.evaluate(
+                f"Blazor._internal.navigationManager.navigateTo("
+                f"'{BASE}/installation-overview/{inst}', false)")
+            try:
+                ctrl._page.wait_for_selector(".device-summary-item, .installation-summary-title, h1, h2", timeout=8_000)
+            except Exception:
+                pass
+            time.sleep(1.5)
+            data = ctrl._page.evaluate("""() => {
+                const out = {};
+                const sels = [
+                    '.installation-summary-title','.installation-title','.installation-name',
+                    '.installation-header-title','.installations-menu-item',
+                    '.topbar-title','.topbar-text','.topbar-installation','.topbar-installation-name',
+                    '.page-title','.page-header','.header-title',
+                    'h1','h2','h3','.title','.name',
+                    '[class*="installation"][class*="title"]',
+                    '[class*="installation"][class*="name"]',
+                ];
+                for (const sel of sels) {
+                    const els = document.querySelectorAll(sel);
+                    const items = [];
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim();
+                        if (t) items.push({text: t.substring(0, 160), class: el.className.substring(0, 200)});
+                    }
+                    if (items.length) out[sel] = items;
+                }
+                return {
+                    url: location.href,
+                    title: document.title,
+                    body_preview: document.body.innerText.substring(0, 600),
+                    matches: out,
+                };
+            }""")
+            return data
     data, code = _safe(ctrl._pw_thread.call, _dump)
     return jsonify(data), code
 
@@ -1341,9 +1485,25 @@ def auth_set_credentials():
 
 @app.route("/auth/reset", methods=["POST"])
 def auth_reset():
-    """Wipe terminal + session + IDs. Next call re-registers from scratch."""
+    """Wipe auth state, then restart the process. The startup path handles
+    re-registration, login, browser (re-)launch, and SPA ID discovery."""
     _auth_mgr.reset_credentials()
-    return jsonify({"ok": True, "message": "Auth state cleared."})
+
+    def _relaunch():
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Timer(0.3, _relaunch).start()
+    return jsonify({"ok": True, "message": "Auth reset — restarting…"})
+
+
+@app.route("/admin/restart", methods=["POST"])
+def admin_restart():
+    """Restart the process in place via os.execv so the bridge comes back
+    on its own (no external supervisor needed, works both in the HA add-on
+    and in local dev)."""
+    def _relaunch():
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Timer(0.3, _relaunch).start()
+    return jsonify({"ok": True, "message": "Server restarting…"})
 
 
 # ── Ingress Control Panel (HTML at /) ─────────────────────────────────────────
@@ -1357,10 +1517,47 @@ def ingress_panel():
 def _build_ingress_html() -> str:
     creds = _auth_mgr.credentials
     st = _auth_mgr.get_status()
-    email_disp = st.get("email") or ""
     session_age = st.get("session_age_seconds")
-    age_disp = f"{session_age}s" if session_age is not None else "—"
     last_err = st.get("last_error") or ""
+
+    def _fmt_age(secs: int | None) -> str:
+        if secs is None:
+            return "—"
+        if secs < 60:
+            return f"{secs}s"
+        m, s = divmod(secs, 60)
+        if m < 60:
+            return f"{m}m {s}s"
+        h, m = divmod(m, 60)
+        if h < 24:
+            return f"{h}h {m}m"
+        d, h = divmod(h, 24)
+        return f"{d}d {h}h"
+
+    age_disp = _fmt_age(session_age)
+    stale = bool(st.get("session_stale"))
+    session_ok = bool(creds.token) and not stale
+    if not creds.token:
+        session_state, session_cls = "NONE", "err"
+        session_detail = "Not acquired"
+    elif stale:
+        session_state, session_cls = "STALE", "warn"
+        session_detail = f"{len(creds.token)} chars · age {age_disp}"
+    else:
+        session_state, session_cls = "ACTIVE", "ok"
+        session_detail = f"{len(creds.token)} chars · age {age_disp}"
+
+    terminal_ok = bool(st["terminal_registered"])
+    terminal_txt = st["terminal_id"] or "Not registered"
+
+    pumps_rows = ''.join(
+        f'<div class="pump-row"><span class="pump-name">{p["name"]}</span>'
+        f'<span class="pump-id">{p["id"]}</span></div>'
+        for p in creds.heat_pumps
+    ) or '<div class="empty">No heat pumps discovered yet.</div>'
+
+    overall_ok = creds.is_complete
+    overall_txt = "Ready" if overall_ok else "Incomplete"
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -1369,95 +1566,235 @@ def _build_ingress_html() -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Polyconnect Bridge</title>
 <style>
-:root {{ --bg: #1a1a2e; --surface: #16213e; --border: #0f3460; --text: #e4e4e4; --dim: #8b8b8b; --accent: #0ea5e9; --green: #4ade80; --yellow: #fbbf24; --red: #f87171; }}
+:root {{
+  --bg: #04141f; --bg-2: #061c2b; --surface: #0a2540; --surface-2: #0e3555;
+  --border: #144b74; --text: #e0f2fe; --dim: #7dd3fc; --muted: #38bdf8;
+  --accent: #38bdf8; --accent-2: #06b6d4; --deep: #0369a1;
+  --green: #34d399; --yellow: #fbbf24; --red: #f87171;
+}}
 * {{ margin:0; padding:0; box-sizing:border-box; }}
-body {{ font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); padding:1.5rem; min-height:100vh; }}
-.container {{ max-width:600px; margin:0 auto; }}
-h1 {{ font-size:1.4rem; margin-bottom:0.3rem; }}
-.subtitle {{ color:var(--dim); font-size:0.82rem; margin-bottom:1.5rem; }}
-.card {{ background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1.2rem; margin-bottom:1rem; }}
-.card h2 {{ font-size:0.9rem; color:var(--accent); margin-bottom:0.7rem; }}
-.row {{ display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; gap:0.5rem; }}
-.row .label {{ color:var(--dim); font-size:0.8rem; }}
-.row .value {{ font-size:0.8rem; font-family:monospace; word-break:break-all; text-align:right; }}
-.ok {{ color:var(--green); }}
-.warn {{ color:var(--yellow); }}
-.err {{ color:var(--red); }}
-.btn {{ display:inline-block; padding:0.6rem 1.2rem; border-radius:8px; font-size:0.82rem; font-weight:600; border:none; cursor:pointer; margin-right:0.5rem; margin-top:0.5rem; }}
-.btn-primary {{ background:var(--accent); color:white; }}
-.btn-danger {{ background:var(--red); color:white; }}
-.btn-outline {{ background:transparent; border:1px solid var(--border); color:var(--text); }}
-.btn:hover {{ opacity:0.9; }}
-.btn:disabled {{ opacity:0.4; cursor:not-allowed; }}
-label {{ display:block; color:var(--dim); font-size:0.75rem; margin-top:0.7rem; margin-bottom:0.3rem; text-transform:uppercase; }}
-input {{ width:100%; padding:0.55rem 0.7rem; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); font-family:monospace; font-size:0.85rem; }}
-input:focus {{ outline:none; border-color:var(--accent); }}
-.help {{ color:var(--dim); font-size:0.75rem; margin-top:0.5rem; line-height:1.4; }}
-.err-banner {{ background:rgba(248,113,113,0.1); border:1px solid var(--red); color:var(--red); padding:0.6rem 0.8rem; border-radius:6px; font-size:0.8rem; margin-bottom:0.8rem; display:none; }}
+body {{
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(56,189,248,0.14), transparent 60%),
+    radial-gradient(1000px 500px at 100% 0%, rgba(6,182,212,0.10), transparent 60%),
+    var(--bg);
+  color: var(--text); min-height: 100vh; padding: 1.25rem;
+}}
+.container {{ max-width: 780px; margin: 0 auto; }}
+
+/* Hero — animated pool-water gradient, text only */
+@keyframes waterFlow {{
+  0%   {{ background-position:   0% 50%; }}
+  50%  {{ background-position: 100% 50%; }}
+  100% {{ background-position:   0% 50%; }}
+}}
+@keyframes shimmer {{
+  0%, 100% {{ opacity: 0.55; transform: translateX(-8%); }}
+  50%      {{ opacity: 0.95; transform: translateX( 8%); }}
+}}
+.hero {{
+  position: relative; overflow: hidden; border-radius: 18px;
+  padding: 2.1rem 1.6rem; text-align: center;
+  background: linear-gradient(120deg,
+      #0369a1 0%, #0ea5e9 22%, #06b6d4 44%, #22d3ee 62%, #0284c7 80%, #164e63 100%);
+  background-size: 300% 300%;
+  animation: waterFlow 14s ease-in-out infinite;
+  box-shadow:
+    0 20px 60px -30px rgba(14,165,233,0.65),
+    0 0 0 1px rgba(255,255,255,0.06) inset;
+}}
+.hero::before {{
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background:
+    radial-gradient(60% 100% at 20% 0%, rgba(255,255,255,0.28), transparent 60%),
+    radial-gradient(50%  80% at 80% 100%, rgba(255,255,255,0.16), transparent 60%);
+  mix-blend-mode: screen;
+  animation: shimmer 7s ease-in-out infinite;
+}}
+.hero::after {{
+  /* subtle caustic-like streaks */
+  content: ""; position: absolute; inset: -50%;
+  background:
+    repeating-linear-gradient(115deg,
+      rgba(255,255,255,0.05) 0 2px,
+      transparent 2px 22px);
+  opacity: 0.6; pointer-events: none;
+  animation: waterFlow 22s linear infinite reverse;
+}}
+.hero h1 {{
+  position: relative; font-size: 1.9rem; font-weight: 800;
+  letter-spacing: -0.02em; color: #ffffff;
+  text-shadow: 0 2px 20px rgba(2,132,199,0.65), 0 1px 0 rgba(255,255,255,0.15);
+}}
+.hero .sub {{
+  position: relative; font-size: 0.88rem; margin-top: 0.35rem;
+  color: rgba(240,249,255,0.9);
+  text-shadow: 0 1px 8px rgba(2,132,199,0.55);
+}}
+
+/* Cards */
+.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem; }}
+@media (max-width: 560px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+.container > .hero,
+.container > .card,
+.container > .grid,
+.container > .actions {{ margin-bottom: 0.9rem; }}
+.container > .hero {{ margin-bottom: 1.25rem; }}
+.card {{
+  background: linear-gradient(180deg, var(--surface) 0%, var(--surface-2) 100%);
+  border: 1px solid var(--border); border-radius: 14px; padding: 1.1rem 1.15rem;
+  box-shadow: 0 10px 30px -20px rgba(0,0,0,0.5);
+}}
+.card h2 {{
+  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em;
+  color: var(--dim); text-transform: uppercase; margin-bottom: 0.7rem;
+  display: flex; align-items: center; gap: 0.45rem;
+}}
+.card h2 .dot {{ width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }}
+
+.stat {{ display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; }}
+.stat .big {{
+  font-size: 0.85rem; font-weight: 500; font-family: ui-monospace, SFMono-Regular, monospace;
+  word-break: break-all; color: var(--text);
+}}
+.stat .big.muted {{ color: var(--dim); }}
+.pill {{
+  display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px;
+  font-size: 0.7rem; font-weight: 600; letter-spacing: 0.03em;
+}}
+.pill.ok  {{ background: rgba(52,211,153,0.15); color: var(--green); border: 1px solid rgba(52,211,153,0.3); }}
+.pill.warn{{ background: rgba(251,191,36,0.15); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }}
+.pill.err {{ background: rgba(248,113,113,0.15); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }}
+
+.ok  {{ color: var(--green); }}
+.warn{{ color: var(--yellow); }}
+.err {{ color: var(--red); }}
+
+.pump-row {{
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 0.55rem 0.7rem; border-radius: 8px; margin-top: 0.5rem;
+  background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.12);
+}}
+.pump-name {{ font-weight: 600; font-size: 0.88rem; }}
+.pump-id {{ font-family: ui-monospace, monospace; font-size: 0.75rem; color: var(--dim); word-break: break-all; }}
+.empty {{ color: var(--muted); font-size: 0.82rem; padding: 0.5rem 0; font-style: italic; }}
+
+.actions {{
+  display: flex; flex-wrap: wrap; gap: 0.6rem;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  padding: 1rem; margin-top: 0.2rem;
+}}
+.btn {{
+  flex: 1 1 auto; min-width: 160px;
+  padding: 0.7rem 1rem; border-radius: 10px;
+  font-size: 0.85rem; font-weight: 600; border: 1px solid transparent;
+  cursor: pointer; transition: transform 0.05s, filter 0.15s;
+  display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+}}
+.btn:hover {{ filter: brightness(1.1); }}
+.btn:active {{ transform: translateY(1px); }}
+.btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+.btn-primary {{ background: linear-gradient(135deg, #0ea5e9, #06b6d4 60%, #22d3ee); color: white; }}
+.btn-outline {{ background: transparent; color: var(--text); border-color: var(--border); }}
+.btn-danger  {{ background: linear-gradient(135deg, #ef4444, #f472b6); color: white; }}
+
+.banner {{
+  padding: 0.7rem 0.9rem; border-radius: 10px; font-size: 0.82rem;
+  margin-bottom: 0.9rem; display: none;
+}}
+.banner.err  {{ background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: var(--red); }}
+.banner.info {{ background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.3); color: var(--accent); }}
+.banner.show {{ display: block; }}
+
+.footer {{ text-align: center; color: var(--muted); font-size: 0.72rem; margin-top: 1.2rem; }}
 </style>
 </head>
 <body>
 <div class="container">
-    <h1>Polyconnect Bridge</h1>
-    <p class="subtitle">v{BRIDGE_VERSION} — Native login (no mitmproxy)</p>
-
-    <!-- Auth status -->
-    <div class="card">
-        <h2>Auth status</h2>
-        <div class="row">
-            <span class="label">Email</span>
-            <span class="value {'ok' if st['email_configured'] else 'warn'}">{email_disp or 'Not configured'}</span>
-        </div>
-        <div class="row">
-            <span class="label">Terminal</span>
-            <span class="value {'ok' if st['terminal_registered'] else 'warn'}">{(st['terminal_id'] or 'Not registered')}</span>
-        </div>
-        <div class="row">
-            <span class="label">Session</span>
-            <span class="value {'ok' if creds.token else 'warn'}">{('Active (' + str(len(creds.token)) + ' chars, ' + age_disp + ')') if creds.token else 'Not acquired'}</span>
-        </div>
-        <div class="row">
-            <span class="label">Heat pumps</span>
-            <span class="value {'ok' if creds.heat_pumps else 'warn'}">{(str(len(creds.heat_pumps)) + ' discovered') if creds.heat_pumps else 'Not discovered yet'}</span>
-        </div>
-        {''.join(f'<div class="row"><span class="label">&nbsp;&nbsp;{p["name"]}</span><span class="value">{p["id"]}</span></div>' for p in creds.heat_pumps)}
-        <div class="row">
-            <span class="label">Installation ID</span>
-            <span class="value {'ok' if creds.installation_id else 'warn'}">{creds.installation_id or 'Not set'}</span>
-        </div>
-        <div class="row">
-            <span class="label">Overall</span>
-            <span class="value {'ok' if creds.is_complete else 'warn'}">{'Ready' if creds.is_complete else 'Incomplete'}</span>
-        </div>
-        {f'<div class="row"><span class="label">Last error</span><span class="value err">{last_err}</span></div>' if last_err else ''}
+    <div class="hero">
+      <h1>Polyconnect Bridge</h1>
+      <div class="sub">v{BRIDGE_VERSION} · pool heat-pump control plane</div>
     </div>
 
-    <!-- Credentials form -->
+    <div id="banner" class="banner"></div>
+
+    <!-- IDs card (installation first, then pumps) -->
     <div class="card">
-        <h2>Credentials</h2>
-        <p class="help">
-            Login uses the same email/password as the official Polyconnect mobile app.
-            Credentials can also be set as add-on options (preferred). Heat pumps are
-            auto-discovered after login. Pin a single pump_id below only if discovery
-            picks something you do not want; leave blank to use the full discovered list.
-        </p>
-        <div id="err-banner" class="err-banner"></div>
-        <form id="cred-form">
-            <label>Email</label>
-            <input type="email" id="f-email" value="{email_disp}" autocomplete="username" required>
-            <label>Password</label>
-            <input type="password" id="f-password" autocomplete="current-password" required placeholder="Re-enter to update">
-            <label>Pin to single heat pump ID <span style="text-transform:none;">(optional, 24-char hex)</span></label>
-            <input type="text" id="f-heat-pump" value="{(creds.heat_pump_id if creds.heat_pumps and len(creds.heat_pumps) == 1 else '')}" pattern="[0-9a-f]{{24}}">
-            <label>Installation ID <span style="text-transform:none;">(24-char hex, optional)</span></label>
-            <input type="text" id="f-install" value="{creds.installation_id or ''}" pattern="[0-9a-f]{{24}}">
-            <div style="margin-top:1rem;">
-                <button type="submit" class="btn btn-primary" id="btn-save">Save &amp; login</button>
-                <button type="button" class="btn btn-outline" id="btn-refresh">Refresh session</button>
-                <button type="button" class="btn btn-danger" id="btn-reset">Reset auth state</button>
-            </div>
-        </form>
+      <h2><span class="dot"></span>Installation</h2>
+      <div class="stat">
+        <span style="color:var(--dim); font-size:0.72rem; letter-spacing:0.08em; text-transform:uppercase;">Name</span>
+        <span id="installation-name" class="big {'ok' if creds.installation_name else ('muted' if creds.installation_id else 'warn')}" style="font-size:1.05rem; font-family: system-ui, sans-serif; font-weight:600;">{creds.installation_name or ('Unnamed installation' if creds.installation_id else 'Not set')}</span>
+        <span id="installation-id" class="big muted" style="font-size:0.78rem;">{creds.installation_id or ''}</span>
+      </div>
+
+      <div style="margin-top: 1.1rem;">
+        <div style="color:var(--dim); font-size:0.72rem; letter-spacing:0.08em; text-transform:uppercase;">
+          Heat pumps · <span id="pumps-count">{len(creds.heat_pumps)}</span>
+        </div>
+        <div id="pumps-list">{pumps_rows}</div>
+      </div>
     </div>
+
+    <!-- Status grid -->
+    <div class="grid">
+      <div class="card">
+        <h2><span class="dot"></span>Session</h2>
+        <div class="stat">
+          <span id="session-pill" class="pill {session_cls}">{session_state}</span>
+          <span id="session-detail" class="big {'muted' if not creds.token else ''}">{session_detail}</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="dot"></span>Terminal</h2>
+        <div class="stat">
+          <span id="terminal-pill" class="pill {'ok' if terminal_ok else 'warn'}">{'REGISTERED' if terminal_ok else 'PENDING'}</span>
+          <span id="terminal-detail" class="big {'muted' if not terminal_ok else ''}">{terminal_txt}</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="dot"></span>Bridge</h2>
+        <div class="stat">
+          <span id="bridge-pill" class="pill {'ok' if overall_ok else 'warn'}">{overall_txt.upper()}</span>
+          <span id="bridge-detail" class="big">{'All systems go' if overall_ok else 'Awaiting login'}</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><span class="dot"></span>Last Error</h2>
+        <div class="stat">
+          <span id="error-pill" class="pill {'err' if last_err else 'ok'}">{'ERROR' if last_err else 'CLEAN'}</span>
+          <span id="error-detail" class="big {'muted' if not last_err else 'err'}">{last_err or 'None'}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="actions">
+      <button type="button" class="btn btn-primary" id="btn-refresh">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>
+        </svg>
+        Refresh Browser
+      </button>
+      <button type="button" class="btn btn-outline" id="btn-restart">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2v6"/><path d="M18.36 5.64a9 9 0 1 1-12.73 0"/>
+        </svg>
+        Restart Server
+      </button>
+      <button type="button" class="btn btn-danger" id="btn-reset">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+        </svg>
+        Reset Auth &amp; IDs
+      </button>
+    </div>
+
+    <div class="footer">Credentials are configured via the add-on options.</div>
 </div>
 
 <script>
@@ -1476,58 +1813,77 @@ const BASE = (() => {{
     return '/';
 }})();
 
-function showError(msg) {{
-    const b = document.getElementById('err-banner');
-    b.textContent = msg;
-    b.style.display = 'block';
+const banner = document.getElementById('banner');
+function show(msg, kind) {{
+    banner.textContent = msg;
+    banner.className = 'banner ' + kind + ' show';
 }}
-function clearError() {{ document.getElementById('err-banner').style.display = 'none'; }}
+function clearBanner() {{ banner.className = 'banner'; }}
 
-document.getElementById('cred-form').addEventListener('submit', async (e) => {{
-    e.preventDefault();
-    clearError();
-    const btn = document.getElementById('btn-save');
-    btn.disabled = true; btn.textContent = 'Logging in…';
-    const body = {{
-        email: document.getElementById('f-email').value.trim(),
-        password: document.getElementById('f-password').value,
-        heat_pump_id: document.getElementById('f-heat-pump').value.trim() || null,
-        installation_id: document.getElementById('f-install').value.trim() || null,
-    }};
+async function post(path, btn, busyLabel, waitReload) {{
+    clearBanner();
+    const originalLabel = btn.innerHTML;
+    btn.disabled = true; btn.innerHTML = busyLabel;
     try {{
-        const r = await fetch(BASE + 'auth/credentials', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify(body),
-        }});
+        const r = await fetch(BASE + path, {{method: 'POST'}});
         const d = await r.json();
-        if (d.ok) location.reload();
-        else {{ showError(d.error || 'Login failed'); btn.disabled = false; btn.textContent = 'Save & login'; }}
+        if (d.ok) {{
+            if (waitReload) {{
+                show(d.message || 'Done. Reloading…', 'info');
+                setTimeout(() => location.reload(), waitReload);
+            }} else {{
+                location.reload();
+            }}
+        }} else {{
+            show(d.error || 'Request failed', 'err');
+            btn.disabled = false; btn.innerHTML = originalLabel;
+        }}
     }} catch (ex) {{
-        showError('Request failed: ' + ex);
-        btn.disabled = false; btn.textContent = 'Save & login';
+        show('Request failed: ' + ex, 'err');
+        btn.disabled = false; btn.innerHTML = originalLabel;
     }}
-}});
+}}
 
-document.getElementById('btn-refresh').addEventListener('click', async () => {{
-    clearError();
-    const btn = document.getElementById('btn-refresh');
-    btn.disabled = true; btn.textContent = 'Refreshing…';
-    try {{
-        const r = await fetch(BASE + 'auth/refresh', {{method: 'POST'}});
-        const d = await r.json();
-        if (d.ok) location.reload();
-        else {{ showError(d.error || 'Refresh failed'); btn.disabled = false; btn.textContent = 'Refresh session'; }}
-    }} catch (ex) {{
-        showError('Request failed: ' + ex);
-        btn.disabled = false; btn.textContent = 'Refresh session';
-    }}
-}});
+function setStat(key, pillText, pillCls, detail, detailMuted) {{
+    const p = document.getElementById(key + '-pill');
+    p.textContent = pillText;
+    p.className = 'pill ' + pillCls;
+    const d = document.getElementById(key + '-detail');
+    d.textContent = detail;
+    d.className = 'big' + (detailMuted ? ' muted' : '');
+}}
+function clearAuthUI() {{
+    const name = document.getElementById('installation-name');
+    name.textContent = 'Not set';
+    name.className = 'big warn';
+    name.style.cssText = 'font-size:1.05rem; font-family: system-ui, sans-serif; font-weight:600;';
+    document.getElementById('installation-id').textContent = '';
+    document.getElementById('pumps-count').textContent = '0';
+    document.getElementById('pumps-list').innerHTML =
+        '<div class="empty">No heat pumps discovered yet.</div>';
+    setStat('session',  'NONE',       'err',  'Not acquired',    true);
+    setStat('terminal', 'PENDING',    'warn', 'Not registered',  true);
+    setStat('bridge',   'INCOMPLETE', 'warn', 'Awaiting login',  false);
+    setStat('error',    'CLEAN',      'ok',   'None',            true);
+}}
 
-document.getElementById('btn-reset').addEventListener('click', async () => {{
-    if (!confirm('Wipe all auth state? Terminal will need to re-register and you will need to log in again.')) return;
-    await fetch(BASE + 'auth/reset', {{method: 'POST'}});
-    location.reload();
+document.getElementById('btn-refresh').addEventListener('click', (e) => {{
+    post('auth/refresh', e.currentTarget, 'Refreshing…', 0);
+}});
+document.getElementById('btn-restart').addEventListener('click', (e) => {{
+    if (!confirm('Restart the bridge server?')) return;
+    post('admin/restart', e.currentTarget, 'Restarting…', 4000);
+}});
+document.getElementById('btn-reset').addEventListener('click', async (e) => {{
+    if (!confirm('Wipe all auth state and restart? Takes ~5 seconds.')) return;
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.innerHTML = 'Clearing…';
+    clearAuthUI();
+    show('Auth state cleared — restarting…', 'info');
+    await new Promise(r => setTimeout(r, 900));
+    btn.innerHTML = 'Restarting…';
+    fetch(BASE + 'auth/reset', {{method: 'POST'}}).catch(() => {{}});
+    setTimeout(() => location.reload(), 5000);
 }});
 </script>
 </body>
@@ -1539,8 +1895,8 @@ document.getElementById('btn-reset').addEventListener('click', async () => {{
 if __name__ == "__main__":
     log.info("Starting Polyconnect Bridge v%s on port %d", BRIDGE_VERSION, PORT)
 
-    if _auth_mgr.credentials.is_complete:
-        log.info("Credentials ready — launching Playwright browser")
+    if _auth_mgr.credentials.token:
+        log.info("Session token ready — launching Playwright browser")
         try:
             ctrl._pw_thread.call(ctrl._launch)
         except Exception as e:
