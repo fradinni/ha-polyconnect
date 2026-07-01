@@ -13,8 +13,6 @@ get_option() {
 export POLYCONNECT_LOG_LEVEL=$(get_option log_level)
 export POLYCONNECT_EMAIL=$(get_option email)
 export POLYCONNECT_PASSWORD=$(get_option password)
-export POLYCONNECT_HEAT_PUMP_ID=$(get_option heat_pump_id)
-export POLYCONNECT_INSTALLATION_ID=$(get_option installation_id)
 
 ADDON_DIR="$(cd "$(dirname "$0")" && pwd)"
 BRIDGE_VERSION=$(grep -oP '(?<=^version: ")[^"]+' "$ADDON_DIR/config.yaml" 2>/dev/null || echo "unknown")
@@ -22,6 +20,5 @@ echo "Starting Polyconnect Bridge v${BRIDGE_VERSION}..."
 echo "  Credentials stored in: /data/"
 echo "  Log level: ${POLYCONNECT_LOG_LEVEL:-info}"
 echo "  Email: ${POLYCONNECT_EMAIL:-<not configured>}"
-echo "  Heat pump ID: ${POLYCONNECT_HEAT_PUMP_ID:-<not configured>}"
 
 exec python3 /server.py
