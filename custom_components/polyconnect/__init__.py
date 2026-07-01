@@ -9,6 +9,7 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 
 from .coordinator import PolyconnectCoordinator
 from .const import DOMAIN, PLATFORMS, LOGGER
@@ -67,3 +68,22 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload the config entry when options change."""
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Allow removing a device from the UI when it no longer maps to a live pump.
+
+    Called by HA when the user clicks "Delete device". Returns True if the
+    device is safe to remove — i.e. no coordinator entry references its
+    identifier. This covers v1→v2 migration orphans (identifier without
+    a pump_id suffix) and pumps that disappeared from the cloud account.
+    """
+    coordinator: PolyconnectCoordinator = entry.runtime_data
+    live_ids = {
+        f"{entry.entry_id}_{p['id']}" for p in (coordinator.pumps or [])
+    }
+    device_ids = {ident[1] for ident in device.identifiers if ident[0] == DOMAIN}
+    # Safe if none of the device's identifiers is currently reported by a pump.
+    return not (device_ids & live_ids)
