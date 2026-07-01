@@ -18,7 +18,7 @@ from pathlib import Path
 
 from auth import AuthManager, DATA_DIR
 
-BRIDGE_VERSION = "2.1.0"
+BRIDGE_VERSION = "2.2.0"
 
 # ── Auth manager (replaces v1 CaptureManager) ─────────────────────────────────
 _auth_mgr = AuthManager()
