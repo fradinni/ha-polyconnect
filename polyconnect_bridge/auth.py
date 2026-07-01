@@ -249,6 +249,7 @@ class AuthError(Exception):
 class Credentials:
     token: str | None = None
     installation_id: str | None = None
+    installation_name: str | None = None
     # Each pump = {"id": "<24-char hex>", "name": "<display name>"}.
     # The list shape supports multi-pump installations; index 0 is the "default"
     # pump (what legacy /status, /setpoint, ... aliases target).
@@ -267,6 +268,7 @@ class Credentials:
         return {
             "token": self.token,
             "installation_id": self.installation_id,
+            "installation_name": self.installation_name,
             "heat_pumps": list(self.heat_pumps),
             # Back-compat aliases for older clients
             "heat_pump_id": self.heat_pump_id,
@@ -335,9 +337,11 @@ class AuthManager:
             try:
                 d = json.loads(IDS_FILE.read_text())
                 self.credentials.installation_id = d.get("installation_id") or None
+                self.credentials.installation_name = d.get("installation_name") or None
                 # Two on-disk shapes are supported:
                 #   v2.0:  {"installation_id": "...", "heat_pump_id": "<one>"}
-                #   v2.1+: {"installation_id": "...", "heat_pumps": [{"id","name"}, ...]}
+                #   v2.1+: {"installation_id": "...", "installation_name": "...",
+                #           "heat_pumps": [{"id","name"}, ...]}
                 if "heat_pumps" in d and isinstance(d["heat_pumps"], list):
                     self.credentials.heat_pumps = [
                         {"id": p["id"], "name": p.get("name") or f"Heat pump {i+1}"}
@@ -387,6 +391,7 @@ class AuthManager:
     def _save_ids(self) -> None:
         IDS_FILE.write_text(json.dumps({
             "installation_id": self.credentials.installation_id,
+            "installation_name": self.credentials.installation_name,
             "heat_pumps": list(self.credentials.heat_pumps),
         }, indent=2) + "\n")
 
@@ -457,7 +462,8 @@ class AuthManager:
                 return {"ok": False, "error": str(e)}
 
     def set_pumps(self, installation_id: str | None,
-                  heat_pumps: list[dict]) -> None:
+                  heat_pumps: list[dict],
+                  installation_name: str | None = None) -> None:
         """Persist discovered pump list without touching session/credentials.
         `heat_pumps` items must be dicts with at least an `id` key; `name`
         defaults to 'Heat pump <N>' if absent. Used by Playwright auto-discovery."""
@@ -475,6 +481,11 @@ class AuthManager:
             if installation_id and installation_id != self.credentials.installation_id:
                 self.credentials.installation_id = installation_id
                 changed = True
+            if installation_name is not None:
+                clean = installation_name.strip() or None
+                if clean != self.credentials.installation_name:
+                    self.credentials.installation_name = clean
+                    changed = True
             # Compare by (id, name) tuples — preserve order.
             old = [(p["id"], p["name"]) for p in self.credentials.heat_pumps]
             new = [(p["id"], p["name"]) for p in normalized]
@@ -483,8 +494,10 @@ class AuthManager:
                 changed = True
             if changed:
                 self._save_ids()
-                log.info("Persisted %d pump(s): installation=%s pumps=%s",
-                         len(normalized), self.credentials.installation_id,
+                log.info("Persisted installation=%s (%r) with %d pump(s): %s",
+                         self.credentials.installation_id,
+                         self.credentials.installation_name,
+                         len(normalized),
                          [(p["id"], p["name"]) for p in normalized])
 
     def reset_credentials(self) -> None:

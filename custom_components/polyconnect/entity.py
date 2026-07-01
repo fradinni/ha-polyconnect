@@ -32,9 +32,11 @@ class PolyconnectEntity(CoordinatorEntity[PolyconnectCoordinator]):
         self._key = key
         # Unique-id includes pump_id so multiple pumps don't collide.
         self._attr_unique_id = f"{coordinator.config_entry.entry_id}_{pump_id}_{key}"
+        installation = coordinator.installation_name
+        device_name = f"{installation} / {pump_name}" if installation else pump_name
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{coordinator.config_entry.entry_id}_{pump_id}")},
-            name=pump_name,
+            name=device_name,
             manufacturer="Polytropic",
             model="Pool Heat Pump",
             configuration_url="https://polytropic.user-app.pool.mytech-connect.io",
