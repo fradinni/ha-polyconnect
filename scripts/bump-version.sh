@@ -28,6 +28,8 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MANIFEST="$ROOT/custom_components/polyconnect/manifest.json"
 ADDON_CONFIG="$ROOT/polyconnect_bridge/config.yaml"
 SERVER_PY="$ROOT/polyconnect_bridge/server.py"
+README="$ROOT/docs/README.md"
+API_REF="$ROOT/docs/api-reference.md"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -89,7 +91,9 @@ bump_integration() {
     fi
 
     sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$new_ver\"/" "$MANIFEST"
-    echo "  ✓ integration: $current → $new_ver  ($MANIFEST)"
+    # docs/README.md — integration line, discriminated by "IoT class"
+    sed -i "s|\(\*\*Version:\*\* \)[0-9]\+\.[0-9]\+\.[0-9]\+\( · \*\*IoT class:\*\*\)|\1$new_ver\2|" "$README"
+    echo "  ✓ integration: $current → $new_ver  ($MANIFEST, $README)"
 }
 
 bump_bridge() {
@@ -104,7 +108,39 @@ bump_bridge() {
 
     sed -i "s/^version: \"[^\"]*\"/version: \"$new_ver\"/" "$ADDON_CONFIG"
     sed -i "s/^BRIDGE_VERSION = \"[^\"]*\"/BRIDGE_VERSION = \"$new_ver\"/" "$SERVER_PY"
-    echo "  ✓ bridge: $current → $new_ver  ($ADDON_CONFIG, $SERVER_PY)"
+    # docs/README.md — bridge line, discriminated by "Ports"
+    sed -i "s|\(\*\*Version:\*\* \)[0-9]\+\.[0-9]\+\.[0-9]\+\( · \*\*Ports:\*\*\)|\1$new_ver\2|" "$README"
+    # docs/api-reference.md — /health example response
+    sed -i "s/\(\"version\": \"\)[0-9]\+\.[0-9]\+\.[0-9]\+\(\",\)/\1$new_ver\2/" "$API_REF"
+    echo "  ✓ bridge: $current → $new_ver  ($ADDON_CONFIG, $SERVER_PY, $README, $API_REF)"
+}
+
+# Grep for any stale version references anywhere in the tree.
+# Catches future doc/code that adds hardcoded versions the sed patterns miss.
+verify_no_stragglers() {
+    local int_ver bridge_ver
+    int_ver="$(get_integration_version)"
+    bridge_ver="$(get_bridge_version)"
+
+    # Find every X.Y.Z-looking string in tracked source files, then filter
+    # to only those NOT matching the current integration/bridge versions.
+    local stragglers
+    stragglers=$(grep -rEn -o '[0-9]+\.[0-9]+\.[0-9]+' \
+        --include='*.py' --include='*.json' --include='*.yaml' --include='*.yml' --include='*.md' \
+        --exclude-dir=.git --exclude-dir=.claude --exclude-dir=__pycache__ --exclude-dir=node_modules \
+        "$ROOT" 2>/dev/null \
+        | grep -viE '(hacs\.json|hassfest|homeassistant/|api-versio|python|playwright|chromium|firefox|mitmproxy|flask|node|npm)' \
+        | grep -E "version|Version|VERSION" \
+        | grep -vE ":${int_ver}$|:${bridge_ver}$" || true)
+
+    if [[ -n "$stragglers" ]]; then
+        echo ""
+        echo "  ⚠ Possible stale version references found (verify manually):"
+        echo "$stragglers" | sed 's/^/    /'
+        echo ""
+        echo "  If any of these are hardcoded versions that should track the bump,"
+        echo "  add them to bump_integration() or bump_bridge() in this script."
+    fi
 }
 
 usage() {
@@ -173,6 +209,9 @@ esac
 
 echo ""
 echo "Done."
+
+verify_no_stragglers
+
 echo ""
 echo "Next steps:"
 case "$COMPONENT" in

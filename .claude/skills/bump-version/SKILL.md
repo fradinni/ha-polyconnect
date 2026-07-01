@@ -23,9 +23,18 @@ Present the output to the user so they can see what's currently deployed.
 
 Ask the user which component(s) to bump using the `question` tool:
 
-- **Integration** — the HA custom component (`custom_components/polyconnect/manifest.json`)
-- **Bridge** — the Supervisor add-on (`polyconnect_bridge/config.yaml` + `server.py`)
+- **Integration** — the HA custom component (`custom_components/polyconnect/manifest.json` + `docs/README.md`)
+- **Bridge** — the Supervisor add-on (`polyconnect_bridge/config.yaml` + `server.py` + `docs/README.md` + `docs/api-reference.md`)
 - **Both** — bump both components
+
+**Files touched per component** (kept in sync by `scripts/bump-version.sh`):
+
+| Component | Files |
+|---|---|
+| integration | `custom_components/polyconnect/manifest.json` — `"version": "..."`<br>`docs/README.md` — `**Version:** X.Y.Z · **IoT class:**` line |
+| bridge | `polyconnect_bridge/config.yaml` — `version: "..."`<br>`polyconnect_bridge/server.py` — `BRIDGE_VERSION = "..."`<br>`docs/README.md` — `**Version:** X.Y.Z · **Ports:**` line<br>`docs/api-reference.md` — `"version": "..."` in the /health example response |
+
+**If you ever hardcode a new version string** somewhere else (a new doc, a log message, an env default), add it to the corresponding `bump_integration()` / `bump_bridge()` function in `scripts/bump-version.sh` — otherwise it will drift on the next bump.
 
 ### Step 3 — Ask bump type
 
@@ -62,6 +71,8 @@ Run the appropriate bump command(s):
 # Both
 ./scripts/bump-version.sh all minor
 ```
+
+The script updates every file listed in Step 2 and finishes with an automatic straggler check (grep for stale `X.Y.Z` labelled "version" that don't match the new version). If the check prints warnings, **do not commit** — either extend the script to cover the missed location, or the warning is a false positive (a dependency version, a JSON schema version, etc.) which the caller must verify manually.
 
 ### Step 6 — Ask about git commit
 
@@ -102,3 +113,4 @@ If the user committed, ask if they want to push:
 - When bumping "both" with a relative bump (patch/minor/major), each component bumps relative to its *own* current version
 - Tags are namespaced: `integration-v2.0.1`, `bridge-v2.0.4`
 - Always show the user the final state after bumping by running `./scripts/bump-version.sh status`
+- The straggler check at the end of every bump is best-effort — grep-based, filtered to obviously-labeled version lines. It catches most drift but is not a proof of completeness. New hardcoded version strings must be added to the script's `bump_integration` / `bump_bridge` functions to be reliably tracked.
