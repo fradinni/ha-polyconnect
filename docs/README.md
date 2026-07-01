@@ -57,7 +57,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 | `switch.py` | Power on/off switch |
 | `const.py` | All constants, mode mappings |
 
-**Version:** 1.0.2 · **IoT class:** `local_polling` · **Platforms:** sensor, climate, binary_sensor, switch
+**Version:** 2.0.0 · **IoT class:** `local_polling` · **Platforms:** sensor, climate, binary_sensor, switch
 
 ### Bridge Add-on (`polyconnect_bridge/`)
 
@@ -71,7 +71,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 | `Dockerfile` | Debian + Chromium + Python |
 | `run.sh` | Startup script |
 
-**Version:** 1.0.6 · **Ports:** 8765 (API/ingress), 8080 (phone setup UI), 8888 (MITM proxy)
+**Version:** 2.0.0 · **Ports:** 8765 (API/ingress)
 
 ---
 

@@ -24,7 +24,7 @@ Health check — always responds, even without credentials.
 {
   "ok": true,
   "service": "polyconnect-bridge",
-  "version": "1.0.6",
+  "version": "2.0.0",
   "credentials_configured": true,
   "capture_phase": "idle"
 }
