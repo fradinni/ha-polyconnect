@@ -890,6 +890,38 @@ class PolyconnectController:
 
     # ── set_setpoint ──────────────────────────────────────────────────────────
 
+    def _wait_slider_ready(self, timeout: float = 15.0) -> bool:
+        """Wait until the round slider is enabled and its handle is laid out."""
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last = self._page.evaluate("""() => {
+                const g = document.getElementById('heat-pump-temperature-gauge-gauge');
+                const h = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+                if (!g || !h) return null;
+                const rs = (typeof jQuery !== 'undefined') &&
+                           jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+                const r = h.getBoundingClientRect();
+                return {disabled: rs ? !!rs.options.disabled : null,
+                        x: r.x, y: r.y, w: r.width, h: r.height};
+            }""")
+            if last and not last.get("disabled") and last.get("w") and last.get("h"):
+                prev = (last.get("x"), last.get("y"))
+                time.sleep(0.4)
+                again = self._page.evaluate("""() => {
+                    const h = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+                    if (!h) return null;
+                    const r = h.getBoundingClientRect();
+                    return {x: r.x, y: r.y, w: r.width, h: r.height};
+                }""")
+                if again and (again["x"], again["y"]) == prev:
+                    return True
+                log.debug("Slider handle still animating, waiting")
+                continue
+            time.sleep(1.0)
+        log.error("Setpoint slider not ready after %.0fs (last=%r)", timeout, last)
+        return False
+
     def set_setpoint(self, temp: float, pump_id: str | None = None) -> dict:
         with self._lock:
             self._ensure()
@@ -897,6 +929,9 @@ class PolyconnectController:
             if not pid:
                 raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
             self._ensure_view(pid)
+            if not self._wait_slider_ready():
+                return {"ok": False,
+                        "error": "setpoint slider unavailable (heat pump off?)"}
             page   = self._page
             target = int(temp)
 
@@ -928,33 +963,80 @@ class PolyconnectController:
             if diff == 0:
                 return {"ok": True, "note": "already at target"}
 
-            gcx, gcy = info["gcx"], info["gcy"]
-            hx,  hy  = info["hx"],  info["hy"]
-            angle    = math.atan2(hy - gcy, hx - gcx)
-            r        = math.sqrt((hx - gcx)**2 + (hy - gcy)**2)
-            rps      = (270 / (info["max"] - info["min"])) * (math.pi / 180)
-            px_step  = r * rps
-            tx       = math.sin(angle)
-            ty       = -math.cos(angle)
-            move     = diff * px_step
+            for attempt in range(1, 4):
+                if attempt > 1:
+                    if not self._wait_slider_ready():
+                        return {"ok": False,
+                                "error": "setpoint slider unavailable (heat pump off?)"}
+                    info = page.evaluate("""(() => {
+                        const gauge  = document.getElementById('heat-pump-temperature-gauge-gauge');
+                        const handle = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+                        if (!gauge || !handle) return null;
+                        const gr = gauge.getBoundingClientRect();
+                        const hr = handle.getBoundingClientRect();
+                        const rs = typeof jQuery !== 'undefined' &&
+                                   jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+                        return {
+                            gcx: gr.x + gr.width / 2, gcy: gr.y + gr.height / 2,
+                            hx:  hr.x + hr.width / 2, hy:  hr.y + hr.height / 2,
+                            current: rs ? rs.getValue() : 0,
+                            min: rs ? rs.options.min : 8, max: rs ? rs.options.max : 32,
+                        };
+                    })()""")
+                    if not info:
+                        return {"ok": False, "error": "setpoint slider vanished"}
+                    current = info["current"]
+                    diff = current - target
+                    if diff == 0:
+                        break
+                    log.info("Setpoint retry %d: current=%s target=%s", attempt, current, target)
 
-            page.mouse.move(hx, hy)
-            page.mouse.down()
-            time.sleep(0.05)
-            steps = max(20, abs(diff) * 5)
-            for i in range(steps + 1):
-                frac = i / steps
-                page.mouse.move(hx + tx * move * frac, hy + ty * move * frac)
-                time.sleep(0.015)
-            page.mouse.up()
-            time.sleep(0.5)
+                gcx, gcy = info["gcx"], info["gcy"]
+                hx,  hy  = info["hx"],  info["hy"]
+                angle    = math.atan2(hy - gcy, hx - gcx)
+                r        = math.sqrt((hx - gcx)**2 + (hy - gcy)**2)
+                rps      = (270 / (info["max"] - info["min"])) * (math.pi / 180)
+                px_step  = r * rps
+                tx       = math.sin(angle)
+                ty       = -math.cos(angle)
+                move     = diff * px_step
+
+                page.mouse.move(hx, hy)
+                page.mouse.down()
+                time.sleep(0.05)
+                steps = max(20, abs(diff) * 5)
+                for i in range(steps + 1):
+                    frac = i / steps
+                    page.mouse.move(hx + tx * move * frac, hy + ty * move * frac)
+                    time.sleep(0.015)
+                page.mouse.up()
+                time.sleep(0.6)
+
+                now = page.evaluate("""() => {
+                    const rs = typeof jQuery !== 'undefined' &&
+                               jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+                    return rs ? rs.getValue() : null;
+                }""")
+                if now == target:
+                    log.info("Setpoint slider reached %s on attempt %d", target, attempt)
+                    break
+                log.warning("Setpoint drag attempt %d left slider at %r (target %s)",
+                            attempt, now, target)
+            else:
+                return {"ok": False,
+                        "error": "setpoint slider would not move after 3 attempts"}
 
             try:
                 page.wait_for_selector(".order-validation-validate", timeout=2_500)
                 page.click(".order-validation-validate")
-                log.info("Setpoint validated: %s°C", temp)
-            except Exception:
-                page.evaluate("() => { const b = document.querySelector('.order-validation-validate'); if (b) b.click(); }")
+                log.info("Setpoint validated: %s C", temp)
+            except Exception as e:
+                clicked = page.evaluate("() => { const b = document.querySelector('.order-validation-validate'); if (b) { b.click(); return true; } return false; }")
+                if clicked:
+                    log.info("Setpoint validated via JS fallback: %s C", temp)
+                else:
+                    log.error("Validate button never appeared: %s", type(e).__name__)
+                    return {"ok": False, "error": "validation button not found"}
             time.sleep(1.0)
             return {"ok": True}
 
@@ -1553,6 +1635,8 @@ def setpoint():
     data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f, None)
     if code != 200:
         return jsonify(data), code
+    if data.get("ok") is False:
+        return jsonify(data), 409
     if data.get("note") == "slider not found in DOM":
         log.error("Setpoint: slider not found in DOM")
         return jsonify({"ok": False, "error": "temperature slider not found"}), 500
