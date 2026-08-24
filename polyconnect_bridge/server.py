@@ -1404,6 +1404,107 @@ def debug_dom():
     return jsonify(data), code
 
 
+@app.route("/debug/setpoint")
+def debug_setpoint():
+    """Dump the temperature gauge + validation bar so the setpoint can be fixed."""
+    def _dump():
+        with ctrl._lock:
+            ctrl._ensure()
+            hp = _get_heat_pump_id()
+            if not hp:
+                return {"error": "no pump configured"}
+            ctrl._ensure_view(hp)
+            time.sleep(1.0)
+            return ctrl._page.evaluate("""() => {
+                const out = {};
+                out.jquery = (typeof jQuery !== 'undefined');
+                const g = document.getElementById('heat-pump-temperature-gauge-gauge');
+                out.gaugeFound = !!g;
+                if (g) {
+                    const r = g.getBoundingClientRect();
+                    out.gaugeRect = {x: Math.round(r.x), y: Math.round(r.y),
+                                     w: Math.round(r.width), h: Math.round(r.height)};
+                    out.gaugeHtml = g.outerHTML.substring(0, 1500);
+                }
+                if (out.jquery) {
+                    const rs = jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+                    out.roundSlider = !!rs;
+                    if (rs) {
+                        out.value = rs.getValue();
+                        out.options = {min: rs.options.min, max: rs.options.max,
+                                       step: rs.options.step, readOnly: rs.options.readOnly,
+                                       disabled: rs.options.disabled,
+                                       startAngle: rs.options.startAngle,
+                                       endAngle: rs.options.endAngle};
+                        out.methods = Object.keys(rs).filter(k => typeof rs[k] === 'function').slice(0, 40);
+                    }
+                }
+                const h = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+                out.handleFound = !!h;
+                if (h) {
+                    const r = h.getBoundingClientRect();
+                    out.handleRect = {x: Math.round(r.x), y: Math.round(r.y),
+                                      w: Math.round(r.width), h: Math.round(r.height)};
+                    out.handleCls = h.className;
+                }
+                out.validation = Array.from(
+                    document.querySelectorAll('[class*="order-validation"], [class*="validate"], [class*="valider"]')
+                ).map(el => {
+                    const r = el.getBoundingClientRect();
+                    return {tag: el.tagName, cls: (el.className||'').toString().substring(0,120),
+                            text: el.textContent.trim().substring(0, 40),
+                            visible: el.offsetParent !== null,
+                            rect: {x: Math.round(r.x), y: Math.round(r.y),
+                                   w: Math.round(r.width), h: Math.round(r.height)}};
+                });
+                out.buttons = Array.from(document.querySelectorAll('button')).map(b => ({
+                    id: b.id || null, cls: (b.className||'').toString().substring(0,90),
+                    text: b.textContent.trim().substring(0, 30),
+                    visible: b.offsetParent !== null}));
+                return out;
+            }""")
+    data, code = _safe(ctrl._pw_thread.call, _dump)
+    return jsonify(data), code
+
+
+@app.route("/debug/onoff")
+def debug_onoff():
+    """Dump the structure of the ON/OFF toggle so selectors can be fixed."""
+    def _dump():
+        with ctrl._lock:
+            ctrl._ensure()
+            hp = _get_heat_pump_id()
+            if not hp:
+                return {"error": "no pump configured"}
+            ctrl._ensure_view(hp)
+            time.sleep(1.0)
+            return ctrl._page.evaluate("""() => {
+                const root = document.querySelector('.co-on-off-button');
+                if (!root) return {found: false};
+                const walk = (el, d) => {
+                    const r = el.getBoundingClientRect();
+                    const onlyText = el.childNodes.length === 1 &&
+                                     el.firstChild.nodeType === 3;
+                    return {
+                        tag: el.tagName,
+                        cls: (el.className || '').toString().substring(0, 140),
+                        id: el.id || null,
+                        text: onlyText ? el.textContent.trim().substring(0, 40) : null,
+                        aria: el.getAttribute('aria-pressed'),
+                        role: el.getAttribute('role'),
+                        pointerEvents: getComputedStyle(el).pointerEvents,
+                        rect: {x: Math.round(r.x), y: Math.round(r.y),
+                               w: Math.round(r.width), h: Math.round(r.height)},
+                        children: d < 4 ? Array.from(el.children).map(c => walk(c, d + 1)) : []
+                    };
+                };
+                return {found: true, tree: walk(root, 0),
+                        html: root.outerHTML.substring(0, 3000)};
+            }""")
+    data, code = _safe(ctrl._pw_thread.call, _dump)
+    return jsonify(data), code
+
+
 @app.route("/setpoint", methods=["POST"])
 def setpoint():
     temp = (request.get_json(silent=True) or {}).get("temperature")
