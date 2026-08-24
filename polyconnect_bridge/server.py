@@ -980,55 +980,67 @@ class PolyconnectController:
             return null;
         }""")
 
-    def _click_power(self):
+    def _click_power(self) -> bool:
         page = self._page
-        for sel in [".heat-pump-on-off button", ".co-on-off-button", "[class*='on-off'] button"]:
+        errors = []
+        for sel in ["#heat-pump-on-off", ".co-on-off-button",
+                    ".heat-pump-on-off button", "[class*='on-off'] button"]:
             try:
                 page.click(sel, timeout=3_000)
                 log.info("Power clicked via CSS: %s", sel)
-                return
-            except Exception:
-                pass
+                return True
+            except Exception as e:
+                errors.append("%s -> %s: %s" % (sel, type(e).__name__,
+                                                str(e).splitlines()[0][:120]))
         result = page.evaluate("""() => {
-            for (const b of document.querySelectorAll('button')) {
-                const t = b.textContent.trim().toUpperCase();
-                if (t === 'ON' || t === 'OFF') { b.click(); return 'text:' + t; }
-            }
-            for (const b of document.querySelectorAll('[class*="power"] button, [class*="switch"] button')) {
-                b.click(); return 'class:' + b.className.substring(0, 40);
-            }
+            const el = document.querySelector('#heat-pump-on-off, .co-on-off-button');
+            if (el) { el.click(); return el.id || el.className.substring(0, 40); }
             return null;
         }""")
         if result:
             log.info("Power clicked via JS fallback: %s", result)
+            return True
+        log.error("Power click FAILED, no selector worked: %s", " | ".join(errors))
+        return False
+
+    def _wait_active(self, want: bool, timeout: float = 25.0) -> bool:
+        """Poll the DOM until the power state matches `want`, or timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1.5)
+            state = self._get_active()
+            if state is want:
+                return True
+        log.warning("Power state did not reach %s within %.0fs (last=%r)",
+                    want, timeout, self._get_active())
+        return False
+
+    def _set_power(self, want_on: bool, pump_id: str | None) -> dict:
+        with self._lock:
+            self._ensure()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError("Unknown pump_id: %r" % (pump_id,))
+            self._ensure_view(pid)
+            state = self._get_active()
+            if state is want_on:
+                return {"ok": True, "verified": True,
+                        "note": "already %s" % ("ON" if want_on else "OFF")}
+            if state is None:
+                log.warning("Power state unreadable before click")
+            if not self._click_power():
+                return {"ok": False, "error": "power control not found"}
+            if self._wait_active(want_on):
+                log.info("Power now %s (verified)", "ON" if want_on else "OFF")
+                return {"ok": True, "verified": True}
+            return {"ok": False, "verified": False,
+                    "error": "click sent but state did not change"}
 
     def turn_on(self, pump_id: str | None = None) -> dict:
-        with self._lock:
-            self._ensure()
-            pid = _resolve_pump(pump_id)
-            if not pid:
-                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
-            self._ensure_view(pid)
-            is_on = self._get_active()
-            if is_on is True:
-                return {"ok": True, "note": "already ON"}
-            self._click_power()
-            time.sleep(2.0)
-            return {"ok": True}
+        return self._set_power(True, pump_id)
 
     def turn_off(self, pump_id: str | None = None) -> dict:
-        with self._lock:
-            self._ensure()
-            pid = _resolve_pump(pump_id)
-            if not pid:
-                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
-            self._ensure_view(pid)
-            is_on = self._get_active()
-            if is_on is False:
-                return {"ok": True, "note": "already OFF"}
-            self._click_power()
-            time.sleep(2.0)
-            return {"ok": True}
+        return self._set_power(False, pump_id)
 
     # ── filtration ────────────────────────────────────────────────────────────
 
