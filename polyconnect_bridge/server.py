@@ -1517,6 +1517,30 @@ def debug_onoff():
     return jsonify(data), code
 
 
+def _verify_after(field, want, timeout: float = 25.0):
+    """Poll get_status() until `field` reaches `want`. Returns (ok, observed)."""
+    deadline = time.time() + timeout
+    observed = None
+    while time.time() < deadline:
+        time.sleep(2.0)
+        try:
+            st = ctrl._pw_thread.call(ctrl.get_status, None)
+        except Exception:
+            continue
+        observed = st.get(field)
+        if observed == want:
+            return True, observed
+    return False, observed
+
+
+def _verified_reply(field, want, observed_ok, observed, label):
+    if observed_ok:
+        return jsonify({"ok": True, "verified": True, field: observed}), 200
+    return jsonify({"ok": False, "verified": False,
+                    "error": "%s not confirmed" % label,
+                    "field": field, "observed": observed}), 500
+
+
 @app.route("/setpoint", methods=["POST"])
 def setpoint():
     temp = (request.get_json(silent=True) or {}).get("temperature")
@@ -1527,7 +1551,15 @@ def setpoint():
     except (TypeError, ValueError):
         return jsonify({"error": "temperature must be a number"}), 400
     data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f, None)
-    return jsonify(data), code
+    if code != 200:
+        return jsonify(data), code
+    if data.get("note") == "slider not found in DOM":
+        log.error("Setpoint: slider not found in DOM")
+        return jsonify({"ok": False, "error": "temperature slider not found"}), 500
+    if data.get("note") == "already at target":
+        return jsonify({"ok": True, "verified": True, "note": "already at target"}), 200
+    ok, observed = _verify_after("setpointTemperature", temp_f)
+    return _verified_reply("setpointTemperature", temp_f, ok, observed, "setpoint")
 
 
 @app.route("/mode", methods=["POST"])
@@ -1539,7 +1571,11 @@ def mode():
     if m not in (MAIN_MODES | REG_MODES):
         return jsonify({"error": f"invalid mode: {m}"}), 400
     data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m, None)
-    return jsonify(data), code
+    if code != 200:
+        return jsonify(data), code
+    field = "operatingMode" if m in MAIN_MODES else "regulationMode"
+    ok, observed = _verify_after(field, m)
+    return _verified_reply(field, m, ok, observed, "mode")
 
 
 @app.route("/on", methods=["POST"])
@@ -1554,16 +1590,26 @@ def turn_off():
     return jsonify(data), code
 
 
+def _filtration_reply(data, code, want):
+    if code != 200:
+        return jsonify(data), code
+    if data.get("note") == "filtration button not found":
+        log.error("Filtration control not found in DOM")
+        return jsonify({"ok": False, "error": "filtration control not found"}), 500
+    ok, observed = _verify_after("filtrationRunning", want)
+    return _verified_reply("filtrationRunning", want, ok, observed, "filtration")
+
+
 @app.route("/filtration/start", methods=["POST"])
 def filtration_start():
     data, code = _safe(ctrl._pw_thread.call, ctrl.start_filtration, None)
-    return jsonify(data), code
+    return _filtration_reply(data, code, True)
 
 
 @app.route("/filtration/stop", methods=["POST"])
 def filtration_stop():
     data, code = _safe(ctrl._pw_thread.call, ctrl.stop_filtration, None)
-    return jsonify(data), code
+    return _filtration_reply(data, code, False)
 
 
 # ── Auth API routes (v2) ──────────────────────────────────────────────────────
