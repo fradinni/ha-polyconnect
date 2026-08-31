@@ -110,17 +110,14 @@ class PolyconnectClimate(PolyconnectEntity, ClimateEntity):
             return reg
         return None
 
-    def _optimistic_update(self, key: str, value) -> None:
-        """Mutate the cached status for this pump and push to HA immediately."""
-        data = self._pump_data
-        if data is not None:
-            data[key] = value
-            self.async_write_ha_state()
-
     async def async_set_temperature(self, **kwargs) -> None:
         temp = kwargs.get("temperature")
-        if temp is not None:
+        if temp is None:
+            return
+        self._optimistic_update("setpointTemperature", float(temp))
+        try:
             await self.coordinator.api.set_setpoint(self._pump_id, float(temp))
+        finally:
             await self.coordinator.async_request_refresh()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
@@ -130,26 +127,34 @@ class PolyconnectClimate(PolyconnectEntity, ClimateEntity):
             "cool": "Froid",
             "auto": "Automatique",
         }.get(hvac_mode.value, "Automatique"))
-        await self.coordinator.api.set_mode(self._pump_id, polyconnect_mode)
-        await asyncio.sleep(_MODE_REFRESH_DELAY)
-        await self.coordinator.async_request_refresh()
+        try:
+            await self.coordinator.api.set_mode(self._pump_id, polyconnect_mode)
+            await asyncio.sleep(_MODE_REFRESH_DELAY)
+        finally:
+            await self.coordinator.async_request_refresh()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         if preset_mode not in REGULATION_MODES:
             return
         self._optimistic_update("regulationMode", preset_mode)
-        await self.coordinator.api.set_mode(self._pump_id, preset_mode)
-        await asyncio.sleep(_MODE_REFRESH_DELAY)
-        await self.coordinator.async_request_refresh()
+        try:
+            await self.coordinator.api.set_mode(self._pump_id, preset_mode)
+            await asyncio.sleep(_MODE_REFRESH_DELAY)
+        finally:
+            await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self) -> None:
         self._optimistic_update("heatPumpActive", True)
-        await self.coordinator.api.turn_on(self._pump_id)
-        await asyncio.sleep(3.0)
-        await self.coordinator.async_request_refresh()
+        try:
+            await self.coordinator.api.turn_on(self._pump_id)
+            await asyncio.sleep(3.0)
+        finally:
+            await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self) -> None:
         self._optimistic_update("heatPumpActive", False)
-        await self.coordinator.api.turn_off(self._pump_id)
-        await asyncio.sleep(3.0)
-        await self.coordinator.async_request_refresh()
+        try:
+            await self.coordinator.api.turn_off(self._pump_id)
+            await asyncio.sleep(3.0)
+        finally:
+            await self.coordinator.async_request_refresh()

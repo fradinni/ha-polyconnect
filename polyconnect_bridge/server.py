@@ -18,7 +18,7 @@ from pathlib import Path
 
 from auth import AuthManager, DATA_DIR
 
-BRIDGE_VERSION = "2.2.0"
+BRIDGE_VERSION = "2.3.0"
 
 # ── Auth manager (replaces v1 CaptureManager) ─────────────────────────────────
 _auth_mgr = AuthManager()
@@ -76,8 +76,42 @@ UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
 MAIN_MODES = {"Chauffage", "Automatique", "Froid"}
 REG_MODES  = {"Eco", "Smart", "Boost"}
 
+# ── Timing budget ─────────────────────────────────────────────────────────────
+# A write plus its verification must finish before the integration's HTTP
+# timeout (api.py), otherwise HA reports a failure for a command that landed.
+# Ceilings that add up on the slowest path, /setpoint:
+#   _ensure_view re-navigation      8 + 12 + 10 = 30s (no-op when already on the
+#                                   pump view, but a preceding mode change
+#                                   leaves the SPA on an edit page)
+#   _SLIDER_READY_TIMEOUT                        15s
+#   3 drag attempts + 2 re-waits                 ~17s
+#   validation button                            ~3.5s
+#   _VERIFY_TIMEOUT (one poll may itself
+#   re-navigate, so treat it as 15 + 30)         ~45s
+# api.py therefore allows 120s per request — keep that in sync when raising any
+# of these, and prefer failing loud inside the bridge over an aiohttp timeout,
+# which tells HA nothing about what went wrong.
+_SLIDER_READY_TIMEOUT  = 15.0   # first wait for the round slider to settle
+_SLIDER_RETRY_TIMEOUT  = 5.0    # re-waits between drag retries
+_POWER_VERIFY_TIMEOUT  = 15.0   # in-page poll for the ON/OFF state to flip
+_VERIFY_TIMEOUT        = 15.0   # route-level get_status() confirmation poll
+_VERIFY_POLL           = 2.0    # delay between get_status() samples
+
+# Machine-readable `reason` values a controller write may return alongside
+# ok:false, mapped to HTTP status codes by _write_failure_code().
+_PRECONDITION_REASONS = {"pump_off"}
+
 # 24-char MongoDB ObjectId in Blazor SPA URLs (/installation-overview/<id>, /heat-pump-view/<id>)
 _OBJECTID_RE = re.compile(r"/([0-9a-f]{24})(?:/|$|\?)")
+
+# Power toggle. The real control is
+# <button id="heat-pump-on-off" class="... co-on-off-button">; the class
+# selectors are kept behind it as fallbacks for other UI variants. The id must
+# come first so reads and clicks always land on the same element.
+# Injected into _STATUS_JS below and reused by _get_active / _click_power, so
+# the state we verify against is the state we scrape.
+_POWER_BTN_SEL = ("#heat-pump-on-off, .heat-pump-on-off button, "
+                  ".co-on-off-button, [class*=\"on-off\"] button")
 
 # ── Status DOM extraction JS ──────────────────────────────────────────────────
 _STATUS_JS = """
@@ -190,7 +224,7 @@ _STATUS_JS = """
 
     // Heat pump on/off
     let heatPumpActive = null;
-    const btn = document.querySelector('.heat-pump-on-off button, .co-on-off-button, [class*="on-off"] button');
+    const btn = document.querySelector('__POWER_BTN_SEL__');
     if (btn) {
         const pressed = btn.getAttribute('aria-pressed');
         if (pressed !== null) heatPumpActive = pressed === 'true';
@@ -231,17 +265,46 @@ _STATUS_JS = """
     const defrostItem = document.querySelector('.istd-ct-list-item:has(.device-ico-defrosting)');
     if (defrostItem) defrostActive = !defrostItem.classList.contains('state-disabled');
 
-    // Alarm
-    let alarmActive = false, alarmMessage = null;
+    // Alarm — the banner is a vertical stack of three items:
+    //   [0] timestamp ("31/08/2026 20:28", "-" until the record loads)
+    //   [1] level row: icon (.alarm-icon-<level>) + label ("Info")
+    //   [2] message  ("Pas de débit d'eau (…)", empty until the text loads)
+    // Blazor renders those in stages and prints the raw resource key
+    // ("AlarmLevel_Info" → "ALARMLEVEL_INFO" once CSS uppercases it) while the
+    // translation is still loading, so read the parts individually, drop the
+    // placeholder/key-shaped ones, and report `alarmHydrated` — the caller
+    // re-reads instead of publishing a half-rendered banner.
+    const RESOURCE_KEY_RE = /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$/;
+    const alarmText = (el) => {
+        const txt = el ? (el.innerText || '').trim() : '';
+        if (!txt || txt === '-') return null;            // placeholder, data not loaded
+        if (RESOURCE_KEY_RE.test(txt)) return null;      // untranslated resource key
+        return txt;
+    };
+
+    let alarmActive = false, alarmMessage = null, alarmHydrated = true;
     const banner = document.querySelector('.heat-pump-view-error-clickable');
     if (banner && banner.offsetParent !== null) {
-        const txt = banner.innerText.trim();
-        if (txt) { alarmActive = true; alarmMessage = txt; }
+        alarmActive = true;
+        const stack = banner.querySelector('.istd-ct-container');
+        const items = stack
+            ? Array.from(stack.children).filter(
+                  el => el.classList.contains('istd-ct-container-item'))
+            : [];
+        let dateTxt = null, levelTxt = null, msgTxt = null;
+        items.forEach((item, i) => {
+            const txt = alarmText(item);
+            if (item.querySelector('.istd-co-icon')) levelTxt = txt;  // level row
+            else if (i === 0)                        dateTxt  = txt;  // timestamp
+            else if (txt)                            msgTxt   = txt;  // message
+        });
+        alarmMessage  = [dateTxt, levelTxt, msgTxt].filter(Boolean).join('\\n') || null;
+        alarmHydrated = msgTxt !== null;
     }
     if (!alarmActive) {
         for (const el of document.querySelectorAll('[class*="alarm"], [class*="error-msg"]')) {
             if (el.offsetParent === null) continue;
-            const txt = el.innerText.trim();
+            const txt = alarmText(el);
             if (txt && !el.classList.contains('device-summary-data-blocked-message')) {
                 alarmActive = true; alarmMessage = txt; break;
             }
@@ -260,10 +323,14 @@ _STATUS_JS = """
         defrostActive:       defrostActive,
         alarmActive:         alarmActive,
         alarmMessage:        alarmMessage,
+        alarmHydrated:       alarmHydrated,
         errorCode:           alarmActive ? 1 : 0,
     };
 }
 """
+
+# Keep the scraped power state and the verified power state on one selector.
+_STATUS_JS = _STATUS_JS.replace("__POWER_BTN_SEL__", _POWER_BTN_SEL)
 
 # ── Info panel opener JS ──────────────────────────────────────────────────────
 # Compressor/filtration status is hidden behind an info icon next to the
@@ -689,15 +756,36 @@ class PolyconnectController:
 
     # ── get_status ────────────────────────────────────────────────────────────
 
+    # A banner whose message is still empty means Blazor is mid-render: the
+    # timestamp and the level land before the translated text does. Waiting for
+    # it here keeps the alarm out of the "data ready" verdict until it is
+    # complete, so _navigate_to_pump() can't hand a half-rendered banner to
+    # _STATUS_JS. Kept as a standalone snippet so get_status() can re-wait on it.
+    _ALARM_READY_JS = """() => {
+        const banner = document.querySelector('.heat-pump-view-error-clickable');
+        if (!banner || banner.offsetParent === null) return true;   // no alarm
+        const stack = banner.querySelector('.istd-ct-container');
+        if (!stack) return false;
+        const items = Array.from(stack.children).filter(
+            el => el.classList.contains('istd-ct-container-item'));
+        return items.some((item, i) =>
+            i > 0 && !item.querySelector('.istd-co-icon') &&
+            (item.innerText || '').trim().length > 0);
+    }"""
+
     _DATA_READY_JS = """() => {
         const setpoint = document.querySelector('.order-and-value-order-number');
         const weather  = document.querySelector('.topbar-weather');
         const gauge    = document.querySelector('.co-gauge-container');
         if (!gauge) return false;
+        if (!(__ALARM_READY__)()) return false;
         if (setpoint && setpoint.textContent.trim()) return true;
         if (weather && weather.textContent.trim()) return true;
         return false;
     }"""
+    _DATA_READY_JS = _DATA_READY_JS.replace("__ALARM_READY__", _ALARM_READY_JS)
+
+    _ALARM_SETTLE_TIMEOUT_MS = 5_000   # extra wait when only the banner lags
 
     def _wait_for_data(self, timeout_ms: int = 8_000) -> float:
         t0 = time.time()
@@ -706,6 +794,38 @@ class PolyconnectController:
         except Exception:
             pass
         return (time.time() - t0) * 1000
+
+    def _scrape_status(self, prev: dict | None = None) -> dict:
+        """Evaluate _STATUS_JS, re-reading once if the alarm banner is still
+        rendering. Without this a scrape that lands mid-render publishes the
+        timestamp and the untranslated level key as the alarm message.
+        `prev` is the last good reading for the pump: when the banner refuses to
+        finish rendering its message is kept rather than replaced by a partial
+        one — the banner proves the alarm is still up, only its text is unread."""
+        data = self._page.evaluate(_STATUS_JS)
+        if data.get("alarmActive") and not data.get("alarmHydrated", True):
+            log.debug("Alarm banner still rendering — waiting up to %dms",
+                      self._ALARM_SETTLE_TIMEOUT_MS)
+            try:
+                self._page.wait_for_function(
+                    self._ALARM_READY_JS, timeout=self._ALARM_SETTLE_TIMEOUT_MS)
+            except Exception:
+                pass
+            data = self._page.evaluate(_STATUS_JS)
+            if not data.get("alarmHydrated", True):
+                prev_msg = (prev or {}).get("alarmMessage")
+                if prev_msg:
+                    log.warning(
+                        "Alarm banner never finished rendering — keeping the last "
+                        "known message %r (partial read was %r)",
+                        prev_msg, data.get("alarmMessage"))
+                    data["alarmMessage"] = prev_msg
+                else:
+                    log.warning(
+                        "Alarm banner never finished rendering — reporting the "
+                        "partial message %r", data.get("alarmMessage"))
+        data.pop("alarmHydrated", None)   # internal flag, not part of the API
+        return data
 
     def get_status(self, pump_id: str | None = None) -> dict:
         with self._lock:
@@ -751,7 +871,7 @@ class PolyconnectController:
                 except Exception:
                     pass  # panel didn't appear; _STATUS_JS falls back to text detection
                 log.debug("Opened info panel via: %s", _info_sel)
-            data = self._page.evaluate(_STATUS_JS)
+            data = self._scrape_status(self._last_data.get(pid))
             if _info_sel:
                 try:
                     self._page.keyboard.press('Escape')
@@ -779,7 +899,7 @@ class PolyconnectController:
                     )
                     self._load_app()
                     self._navigate_to_pump(pid)
-                    data = self._page.evaluate(_STATUS_JS)
+                    data = self._scrape_status(prev)
                     self._unchanged_count[pid] = 0
                     self._last_change_ts[pid] = time.time()
             else:
@@ -890,6 +1010,68 @@ class PolyconnectController:
 
     # ── set_setpoint ──────────────────────────────────────────────────────────
 
+    _SLIDER_READ_JS = """() => {
+        const gauge  = document.getElementById('heat-pump-temperature-gauge-gauge');
+        const handle = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+        const orderNum = document.querySelector('.order-and-value-order-number');
+        if (!gauge || !handle) return null;
+        const gr = gauge.getBoundingClientRect();
+        const hr = handle.getBoundingClientRect();
+        const rs = typeof jQuery !== 'undefined' &&
+                   jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+        return {
+            gcx: gr.x + gr.width / 2, gcy: gr.y + gr.height / 2,
+            hx:  hr.x + hr.width / 2, hy:  hr.y + hr.height / 2,
+            current: rs ? rs.getValue()
+                        : parseInt((orderNum && orderNum.textContent) || '29'),
+            min: rs ? rs.options.min : 8, max: rs ? rs.options.max : 32,
+        };
+    }"""
+
+    _SLIDER_VALUE_JS = """() => {
+        const rs = typeof jQuery !== 'undefined' &&
+                   jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+        return rs ? rs.getValue() : null;
+    }"""
+
+    def _read_slider(self) -> dict | None:
+        """Gauge/handle geometry plus the slider's current value, or None."""
+        return self._page.evaluate(self._SLIDER_READ_JS)
+
+    def _wait_slider_ready(self, timeout: float = _SLIDER_READY_TIMEOUT) -> bool:
+        """Wait until the round slider is enabled and its handle is laid out."""
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last = self._page.evaluate("""() => {
+                const g = document.getElementById('heat-pump-temperature-gauge-gauge');
+                const h = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+                if (!g || !h) return null;
+                const rs = (typeof jQuery !== 'undefined') &&
+                           jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+                const r = h.getBoundingClientRect();
+                return {disabled: rs ? !!rs.options.disabled : null,
+                        x: r.x, y: r.y, w: r.width, h: r.height};
+            }""")
+            if last and not last.get("disabled") and last.get("w") and last.get("h"):
+                if last.get("disabled") is None:
+                    log.debug("roundSlider unreachable, assuming the gauge is enabled")
+                prev = (last.get("x"), last.get("y"))
+                time.sleep(0.4)
+                again = self._page.evaluate("""() => {
+                    const h = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+                    if (!h) return null;
+                    const r = h.getBoundingClientRect();
+                    return {x: r.x, y: r.y, w: r.width, h: r.height};
+                }""")
+                if again and (again["x"], again["y"]) == prev:
+                    return True
+                log.debug("Slider handle still animating, waiting")
+                continue
+            time.sleep(1.0)
+        log.error("Setpoint slider not ready after %.0fs (last=%r)", timeout, last)
+        return False
+
     def set_setpoint(self, temp: float, pump_id: str | None = None) -> dict:
         with self._lock:
             self._ensure()
@@ -897,73 +1079,92 @@ class PolyconnectController:
             if not pid:
                 raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
             self._ensure_view(pid)
+            if not self._wait_slider_ready():
+                return {"ok": False, "reason": "pump_off",
+                        "error": "setpoint slider unavailable (heat pump off?)"}
             page   = self._page
             target = int(temp)
 
-            info = page.evaluate("""(() => {
-                const gauge  = document.getElementById('heat-pump-temperature-gauge-gauge');
-                const handle = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
-                const orderNum = document.querySelector('.order-and-value-order-number');
-                if (!gauge || !handle) return null;
-                const gr = gauge.getBoundingClientRect();
-                const hr = handle.getBoundingClientRect();
-                const rs = typeof jQuery !== 'undefined' &&
-                           jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
-                return {
-                    gcx: gr.x + gr.width / 2, gcy: gr.y + gr.height / 2,
-                    hx:  hr.x + hr.width / 2, hy:  hr.y + hr.height / 2,
-                    current: rs ? rs.getValue() : parseInt(orderNum?.textContent || '29'),
-                    min: rs ? rs.options.min : 8, max: rs ? rs.options.max : 32,
-                };
-            })()""")
+            info = self._read_slider()
 
             if not info:
-                log.warning("Temperature slider not found in DOM")
-                return {"ok": True, "note": "slider not found in DOM"}
+                log.error("Temperature slider not found in DOM")
+                return {"ok": False, "reason": "slider_missing",
+                        "error": "temperature slider not found"}
 
             current = info["current"]
             diff    = current - target
             log.info("Setpoint: current=%s target=%s diff=%s", current, target, diff)
 
             if diff == 0:
-                return {"ok": True, "note": "already at target"}
+                return {"ok": True, "verified": True, "note": "already at target"}
 
-            gcx, gcy = info["gcx"], info["gcy"]
-            hx,  hy  = info["hx"],  info["hy"]
-            angle    = math.atan2(hy - gcy, hx - gcx)
-            r        = math.sqrt((hx - gcx)**2 + (hy - gcy)**2)
-            rps      = (270 / (info["max"] - info["min"])) * (math.pi / 180)
-            px_step  = r * rps
-            tx       = math.sin(angle)
-            ty       = -math.cos(angle)
-            move     = diff * px_step
+            for attempt in range(1, 4):
+                if attempt > 1:
+                    if not self._wait_slider_ready(_SLIDER_RETRY_TIMEOUT):
+                        return {"ok": False, "reason": "pump_off",
+                                "error": "setpoint slider unavailable (heat pump off?)"}
+                    info = self._read_slider()
+                    if not info:
+                        return {"ok": False, "reason": "slider_missing",
+                                "error": "setpoint slider vanished"}
+                    current = info["current"]
+                    diff = current - target
+                    if diff == 0:
+                        break
+                    log.info("Setpoint retry %d: current=%s target=%s", attempt, current, target)
 
-            page.mouse.move(hx, hy)
-            page.mouse.down()
-            time.sleep(0.05)
-            steps = max(20, abs(diff) * 5)
-            for i in range(steps + 1):
-                frac = i / steps
-                page.mouse.move(hx + tx * move * frac, hy + ty * move * frac)
-                time.sleep(0.015)
-            page.mouse.up()
-            time.sleep(0.5)
+                gcx, gcy = info["gcx"], info["gcy"]
+                hx,  hy  = info["hx"],  info["hy"]
+                angle    = math.atan2(hy - gcy, hx - gcx)
+                r        = math.sqrt((hx - gcx)**2 + (hy - gcy)**2)
+                rps      = (270 / (info["max"] - info["min"])) * (math.pi / 180)
+                px_step  = r * rps
+                tx       = math.sin(angle)
+                ty       = -math.cos(angle)
+                move     = diff * px_step
+
+                page.mouse.move(hx, hy)
+                page.mouse.down()
+                time.sleep(0.05)
+                steps = max(20, abs(diff) * 5)
+                for i in range(steps + 1):
+                    frac = i / steps
+                    page.mouse.move(hx + tx * move * frac, hy + ty * move * frac)
+                    time.sleep(0.015)
+                page.mouse.up()
+                time.sleep(0.6)
+
+                now = page.evaluate(self._SLIDER_VALUE_JS)
+                if now == target:
+                    log.info("Setpoint slider reached %s on attempt %d", target, attempt)
+                    break
+                log.warning("Setpoint drag attempt %d left slider at %r (target %s)",
+                            attempt, now, target)
+            else:
+                return {"ok": False, "reason": "slider_stuck",
+                        "error": "setpoint slider would not move after 3 attempts"}
 
             try:
                 page.wait_for_selector(".order-validation-validate", timeout=2_500)
                 page.click(".order-validation-validate")
-                log.info("Setpoint validated: %s°C", temp)
-            except Exception:
-                page.evaluate("() => { const b = document.querySelector('.order-validation-validate'); if (b) b.click(); }")
+                log.info("Setpoint validated: %s C", temp)
+            except Exception as e:
+                clicked = page.evaluate("() => { const b = document.querySelector('.order-validation-validate'); if (b) { b.click(); return true; } return false; }")
+                if clicked:
+                    log.info("Setpoint validated via JS fallback: %s C", temp)
+                else:
+                    log.error("Validate button never appeared: %s", type(e).__name__)
+                    return {"ok": False, "reason": "validation_missing",
+                            "error": "validation button not found"}
             time.sleep(1.0)
             return {"ok": True}
 
     # ── power on/off ──────────────────────────────────────────────────────────
 
     def _get_active(self) -> bool | None:
-        return self._page.evaluate("""() => {
-            const btn = document.querySelector(
-                '.heat-pump-on-off button, .co-on-off-button, [class*="on-off"] button');
+        return self._page.evaluate("""(sel) => {
+            const btn = document.querySelector(sel);
             if (btn) {
                 const p = btn.getAttribute('aria-pressed');
                 if (p !== null) return p === 'true';
@@ -978,57 +1179,86 @@ class PolyconnectController:
                 }
             }
             return null;
-        }""")
+        }""", _POWER_BTN_SEL)
 
-    def _click_power(self):
+    def _click_power(self) -> bool:
         page = self._page
-        for sel in [".heat-pump-on-off button", ".co-on-off-button", "[class*='on-off'] button"]:
+        errors = []
+        for sel in _POWER_BTN_SEL.split(", "):
             try:
                 page.click(sel, timeout=3_000)
                 log.info("Power clicked via CSS: %s", sel)
-                return
-            except Exception:
-                pass
-        result = page.evaluate("""() => {
-            for (const b of document.querySelectorAll('button')) {
-                const t = b.textContent.trim().toUpperCase();
-                if (t === 'ON' || t === 'OFF') { b.click(); return 'text:' + t; }
-            }
-            for (const b of document.querySelectorAll('[class*="power"] button, [class*="switch"] button')) {
-                b.click(); return 'class:' + b.className.substring(0, 40);
-            }
+                return True
+            except Exception as e:
+                errors.append("%s -> %s: %s" % (sel, type(e).__name__,
+                                                str(e).splitlines()[0][:120]))
+        result = page.evaluate("""(sel) => {
+            const el = document.querySelector(sel);
+            if (el) { el.click(); return el.id || el.className.substring(0, 40); }
             return null;
-        }""")
+        }""", _POWER_BTN_SEL)
         if result:
             log.info("Power clicked via JS fallback: %s", result)
+            return True
+        log.error("Power click FAILED, no selector worked: %s", " | ".join(errors))
+        return False
+
+    def _wait_active(self, want: bool, timeout: float = _POWER_VERIFY_TIMEOUT) -> bool | None:
+        """Poll the DOM until the power state matches `want`.
+
+        Returns True when it matched, False when it stayed readable but wrong,
+        and None when the state was never readable — the caller then falls back
+        to verifying through get_status(), which has a text-based fallback.
+        """
+        deadline = time.time() + timeout
+        state = None
+        readable = False
+        while time.time() < deadline:
+            time.sleep(1.5)
+            state = self._get_active()
+            if state is not None:
+                readable = True
+            if state is want:
+                return True
+        if not readable:
+            log.warning("Power state unreadable for %.0fs, deferring to status poll", timeout)
+            return None
+        log.warning("Power state did not reach %s within %.0fs (last=%r)",
+                    want, timeout, state)
+        return False
+
+    def _set_power(self, want_on: bool, pump_id: str | None) -> dict:
+        with self._lock:
+            self._ensure()
+            pid = _resolve_pump(pump_id)
+            if not pid:
+                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
+            self._ensure_view(pid)
+            state = self._get_active()
+            if state is want_on:
+                return {"ok": True, "verified": True,
+                        "note": "already %s" % ("ON" if want_on else "OFF")}
+            if state is None:
+                log.warning("Power state unreadable before click")
+            if not self._click_power():
+                return {"ok": False, "reason": "control_missing",
+                        "error": "power control not found"}
+            reached = self._wait_active(want_on)
+            if reached is True:
+                log.info("Power now %s (verified)", "ON" if want_on else "OFF")
+                return {"ok": True, "verified": True}
+            if reached is None:
+                # Clicked, but the DOM never told us the state. Report success
+                # without `verified` so the route confirms via get_status().
+                return {"ok": True}
+            return {"ok": False, "verified": False, "reason": "state_unchanged",
+                    "error": "click sent but state did not change"}
 
     def turn_on(self, pump_id: str | None = None) -> dict:
-        with self._lock:
-            self._ensure()
-            pid = _resolve_pump(pump_id)
-            if not pid:
-                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
-            self._ensure_view(pid)
-            is_on = self._get_active()
-            if is_on is True:
-                return {"ok": True, "note": "already ON"}
-            self._click_power()
-            time.sleep(2.0)
-            return {"ok": True}
+        return self._set_power(True, pump_id)
 
     def turn_off(self, pump_id: str | None = None) -> dict:
-        with self._lock:
-            self._ensure()
-            pid = _resolve_pump(pump_id)
-            if not pid:
-                raise RuntimeError(f"Unknown pump_id: {pump_id!r}")
-            self._ensure_view(pid)
-            is_on = self._get_active()
-            if is_on is False:
-                return {"ok": True, "note": "already OFF"}
-            self._click_power()
-            time.sleep(2.0)
-            return {"ok": True}
+        return self._set_power(False, pump_id)
 
     # ── filtration ────────────────────────────────────────────────────────────
 
@@ -1090,7 +1320,8 @@ class PolyconnectController:
         if result.get('found'):
             is_on = result.get('state', False)
             if (want_on and is_on) or (not want_on and not is_on):
-                return {"ok": True, "note": f"already {'running' if want_on else 'stopped'}"}
+                return {"ok": True, "verified": True,
+                        "note": f"already {'running' if want_on else 'stopped'}"}
             self._click_found_filtration(result)
             time.sleep(2.0)
             return {"ok": True}
@@ -1121,7 +1352,9 @@ class PolyconnectController:
             page.evaluate(
                 f"Blazor._internal.navigationManager.navigateTo("
                 f"'{BASE}/heat-pump-view/{heat_pump}', false)")
-            return {"ok": True, "note": "filtration button not found"}
+            log.error("Filtration control not found in DOM")
+            return {"ok": False, "reason": "control_missing",
+                    "error": "filtration control not found"}
 
     def start_filtration(self, pump_id: str | None = None) -> dict:
         with self._lock:
@@ -1148,21 +1381,141 @@ ctrl = PolyconnectController()
 app  = Flask(__name__)
 
 
+def _error_payload(e: Exception) -> tuple[dict, int] | None:
+    """Classify a controller RuntimeError into a payload the integration knows.
+
+    Returns None when the error is not one of the recognised fatal conditions,
+    so callers can decide between retrying and reporting a generic 500.
+    """
+    msg = str(e).lower()
+    if "expired" in msg or "refreshed" in msg or "recapture" in msg:
+        return {"error": str(e), "auth_expired": True}, 401
+    if "unknown pump_id" in msg:
+        return {"error": str(e), "pump_not_found": True}, 404
+    if "no session token" in msg or "no heat pump" in msg:
+        return {"error": str(e), "credentials_missing": True}, 503
+    return None
+
+
 def _safe(fn, *a, **kw):
     try:
         return fn(*a, **kw), 200
     except RuntimeError as e:
-        msg = str(e).lower()
-        if "expired" in msg or "refreshed" in msg or "recapture" in msg:
-            return {"error": str(e), "auth_expired": True}, 401
-        if "unknown pump_id" in msg:
-            return {"error": str(e), "pump_not_found": True}, 404
-        if "no session token" in msg or "no heat pump" in msg:
-            return {"error": str(e), "credentials_missing": True}, 503
+        classified = _error_payload(e)
+        if classified:
+            return classified
         return {"error": str(e)}, 500
     except Exception as e:
-        log.exception("Unhandled error in %s", fn.__name__)
+        log.exception("Unhandled error in %s", getattr(fn, "__name__", fn))
         return {"error": str(e)}, 500
+
+
+# ── Verified write commands ───────────────────────────────────────────────────
+# Every write funnels through _verified_write, and both the per-pump routes the
+# integration calls and the legacy single-pump aliases delegate to the same
+# _handle_* helpers. Keep it that way: verification bolted onto one route
+# family only is indistinguishable from no verification at all.
+
+def _write_failure_code(data: dict) -> int:
+    """409 when the device state made the command impossible, else 500."""
+    return 409 if data.get("reason") in _PRECONDITION_REASONS else 500
+
+
+def _verify_after(field: str, want, pump_id: str | None,
+                  timeout: float = _VERIFY_TIMEOUT) -> tuple[bool, object]:
+    """Poll get_status() until `field` reaches `want`. Returns (ok, observed).
+
+    Recognised fatal errors (expired session, missing credentials, unknown
+    pump) are re-raised so the caller answers with a real 401/503/404 instead
+    of masking them as a generic "not confirmed" failure.
+    """
+    deadline = time.time() + timeout
+    observed = None
+    while time.time() < deadline:
+        time.sleep(_VERIFY_POLL)
+        try:
+            st = ctrl._pw_thread.call(ctrl.get_status, pump_id)
+        except RuntimeError as e:
+            if _error_payload(e):
+                raise
+            log.debug("Verification poll failed, retrying: %s", e)
+            continue
+        except Exception as e:
+            log.debug("Verification poll failed, retrying: %s", e)
+            continue
+        observed = st.get(field)
+        if observed == want:
+            return True, observed
+    return False, observed
+
+
+def _verified_write(field: str, want, label: str, pump_id: str | None,
+                    fn, *args):
+    """Run a controller write, then confirm the change landed in get_status()."""
+    data, code = _safe(ctrl._pw_thread.call, fn, *args)
+    if code != 200:
+        return jsonify(data), code
+    if data.get("ok") is False:
+        log.error("%s failed: %s", label, data.get("error"))
+        return jsonify(data), _write_failure_code(data)
+    if data.get("verified") is True:
+        # Already in the requested state, or confirmed in-page by the
+        # controller — no point re-reading the whole status panel.
+        return jsonify(data), 200
+    try:
+        ok, observed = _verify_after(field, want, pump_id)
+    except RuntimeError as e:
+        classified = _error_payload(e)
+        if classified:
+            payload, err_code = classified
+            return jsonify(payload), err_code
+        return jsonify({"error": str(e)}), 500
+    if ok:
+        return jsonify({"ok": True, "verified": True, field: observed}), 200
+    log.error("%s not confirmed: %s=%r (wanted %r)", label, field, observed, want)
+    return jsonify({"ok": False, "verified": False,
+                    "error": f"{label} not confirmed",
+                    "field": field, "observed": observed}), 500
+
+
+def _handle_setpoint(pump_id: str | None):
+    temp = (request.get_json(silent=True) or {}).get("temperature")
+    if temp is None:
+        return jsonify({"error": "missing temperature"}), 400
+    try:
+        temp_f = float(temp)
+    except (TypeError, ValueError):
+        return jsonify({"error": "temperature must be a number"}), 400
+    # The round slider only accepts whole degrees and set_setpoint truncates,
+    # so verify against the value that will actually be applied — asking for
+    # 28.5 must not fail verification against an applied 28.
+    target = float(int(temp_f))
+    return _verified_write("setpointTemperature", target, "setpoint", pump_id,
+                           ctrl.set_setpoint, target, pump_id)
+
+
+def _handle_mode(pump_id: str | None):
+    m = (request.get_json(silent=True) or {}).get("mode", "")
+    if not m:
+        return jsonify({"error": "missing mode"}), 400
+    if m not in (MAIN_MODES | REG_MODES):
+        return jsonify({"error": f"invalid mode: {m}"}), 400
+    field = "operatingMode" if m in MAIN_MODES else "regulationMode"
+    return _verified_write(field, m, "mode", pump_id, ctrl.set_mode, m, pump_id)
+
+
+def _handle_power(pump_id: str | None, want_on: bool):
+    fn = ctrl.turn_on if want_on else ctrl.turn_off
+    return _verified_write("heatPumpActive", want_on,
+                           "power on" if want_on else "power off",
+                           pump_id, fn, pump_id)
+
+
+def _handle_filtration(pump_id: str | None, want_on: bool):
+    fn = ctrl.start_filtration if want_on else ctrl.stop_filtration
+    return _verified_write("filtrationRunning", want_on,
+                           "filtration start" if want_on else "filtration stop",
+                           pump_id, fn, pump_id)
 
 
 # ── Bridge API routes (existing) ──────────────────────────────────────────────
@@ -1211,54 +1564,36 @@ def pump_status(pump_id: str):
 
 @app.route("/pumps/<pump_id>/setpoint", methods=["POST"])
 def pump_setpoint(pump_id: str):
-    temp = (request.get_json(silent=True) or {}).get("temperature")
-    if temp is None:
-        return jsonify({"error": "missing temperature"}), 400
-    try:
-        temp_f = float(temp)
-    except (TypeError, ValueError):
-        return jsonify({"error": "temperature must be a number"}), 400
-    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f, pump_id)
-    return jsonify(data), code
+    return _handle_setpoint(pump_id)
 
 
 @app.route("/pumps/<pump_id>/mode", methods=["POST"])
 @app.route("/pumps/<pump_id>/regulation_mode", methods=["POST"])
 def pump_mode(pump_id: str):
-    m = (request.get_json(silent=True) or {}).get("mode", "")
-    if not m:
-        return jsonify({"error": "missing mode"}), 400
-    if m not in (MAIN_MODES | REG_MODES):
-        return jsonify({"error": f"invalid mode: {m}"}), 400
-    data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m, pump_id)
-    return jsonify(data), code
+    return _handle_mode(pump_id)
 
 
 @app.route("/pumps/<pump_id>/on", methods=["POST"])
 def pump_on(pump_id: str):
-    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_on, pump_id)
-    return jsonify(data), code
+    return _handle_power(pump_id, True)
 
 
 @app.route("/pumps/<pump_id>/off", methods=["POST"])
 def pump_off(pump_id: str):
-    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_off, pump_id)
-    return jsonify(data), code
+    return _handle_power(pump_id, False)
 
 
 @app.route("/pumps/<pump_id>/filtration/start", methods=["POST"])
 def pump_filtration_start(pump_id: str):
-    data, code = _safe(ctrl._pw_thread.call, ctrl.start_filtration, pump_id)
-    return jsonify(data), code
+    return _handle_filtration(pump_id, True)
 
 
 @app.route("/pumps/<pump_id>/filtration/stop", methods=["POST"])
 def pump_filtration_stop(pump_id: str):
-    data, code = _safe(ctrl._pw_thread.call, ctrl.stop_filtration, pump_id)
-    return jsonify(data), code
+    return _handle_filtration(pump_id, False)
 
 
-# ── Legacy single-pump aliases (v1 / v2.0 compat — target first pump) ─────────
+# ── Debug routes ──────────────────────────────────────────────────────────────
 
 
 @app.route("/debug/info-panel")
@@ -1404,53 +1739,140 @@ def debug_dom():
     return jsonify(data), code
 
 
+@app.route("/debug/setpoint")
+def debug_setpoint():
+    """Dump the temperature gauge + validation bar so the setpoint can be fixed."""
+    def _dump():
+        with ctrl._lock:
+            ctrl._ensure()
+            hp = _get_heat_pump_id()
+            if not hp:
+                return {"error": "no pump configured"}
+            ctrl._ensure_view(hp)
+            time.sleep(1.0)
+            return ctrl._page.evaluate("""() => {
+                const out = {};
+                out.jquery = (typeof jQuery !== 'undefined');
+                const g = document.getElementById('heat-pump-temperature-gauge-gauge');
+                out.gaugeFound = !!g;
+                if (g) {
+                    const r = g.getBoundingClientRect();
+                    out.gaugeRect = {x: Math.round(r.x), y: Math.round(r.y),
+                                     w: Math.round(r.width), h: Math.round(r.height)};
+                    out.gaugeHtml = g.outerHTML.substring(0, 1500);
+                }
+                if (out.jquery) {
+                    const rs = jQuery('#heat-pump-temperature-gauge-gauge').data('roundSlider');
+                    out.roundSlider = !!rs;
+                    if (rs) {
+                        out.value = rs.getValue();
+                        out.options = {min: rs.options.min, max: rs.options.max,
+                                       step: rs.options.step, readOnly: rs.options.readOnly,
+                                       disabled: rs.options.disabled,
+                                       startAngle: rs.options.startAngle,
+                                       endAngle: rs.options.endAngle};
+                        out.methods = Object.keys(rs).filter(k => typeof rs[k] === 'function').slice(0, 40);
+                    }
+                }
+                const h = document.querySelector('#heat-pump-temperature-gauge-gauge .rs-handle');
+                out.handleFound = !!h;
+                if (h) {
+                    const r = h.getBoundingClientRect();
+                    out.handleRect = {x: Math.round(r.x), y: Math.round(r.y),
+                                      w: Math.round(r.width), h: Math.round(r.height)};
+                    out.handleCls = h.className;
+                }
+                out.validation = Array.from(
+                    document.querySelectorAll('[class*="order-validation"], [class*="validate"], [class*="valider"]')
+                ).map(el => {
+                    const r = el.getBoundingClientRect();
+                    return {tag: el.tagName, cls: (el.className||'').toString().substring(0,120),
+                            text: el.textContent.trim().substring(0, 40),
+                            visible: el.offsetParent !== null,
+                            rect: {x: Math.round(r.x), y: Math.round(r.y),
+                                   w: Math.round(r.width), h: Math.round(r.height)}};
+                });
+                out.buttons = Array.from(document.querySelectorAll('button')).map(b => ({
+                    id: b.id || null, cls: (b.className||'').toString().substring(0,90),
+                    text: b.textContent.trim().substring(0, 30),
+                    visible: b.offsetParent !== null}));
+                return out;
+            }""")
+    data, code = _safe(ctrl._pw_thread.call, _dump)
+    return jsonify(data), code
+
+
+@app.route("/debug/onoff")
+def debug_onoff():
+    """Dump the structure of the ON/OFF toggle so selectors can be fixed."""
+    def _dump():
+        with ctrl._lock:
+            ctrl._ensure()
+            hp = _get_heat_pump_id()
+            if not hp:
+                return {"error": "no pump configured"}
+            ctrl._ensure_view(hp)
+            time.sleep(1.0)
+            return ctrl._page.evaluate("""() => {
+                const root = document.querySelector('.co-on-off-button');
+                if (!root) return {found: false};
+                const walk = (el, d) => {
+                    const r = el.getBoundingClientRect();
+                    const onlyText = el.childNodes.length === 1 &&
+                                     el.firstChild.nodeType === 3;
+                    return {
+                        tag: el.tagName,
+                        cls: (el.className || '').toString().substring(0, 140),
+                        id: el.id || null,
+                        text: onlyText ? el.textContent.trim().substring(0, 40) : null,
+                        aria: el.getAttribute('aria-pressed'),
+                        role: el.getAttribute('role'),
+                        pointerEvents: getComputedStyle(el).pointerEvents,
+                        rect: {x: Math.round(r.x), y: Math.round(r.y),
+                               w: Math.round(r.width), h: Math.round(r.height)},
+                        children: d < 4 ? Array.from(el.children).map(c => walk(c, d + 1)) : []
+                    };
+                };
+                return {found: true, tree: walk(root, 0),
+                        html: root.outerHTML.substring(0, 3000)};
+            }""")
+    data, code = _safe(ctrl._pw_thread.call, _dump)
+    return jsonify(data), code
+
+
+# ── Legacy single-pump aliases (v1 / v2.0 compat — target first pump) ─────────
+# Thin delegates to the shared _handle_* helpers so they verify writes exactly
+# like the per-pump routes above.
+
 @app.route("/setpoint", methods=["POST"])
 def setpoint():
-    temp = (request.get_json(silent=True) or {}).get("temperature")
-    if temp is None:
-        return jsonify({"error": "missing temperature"}), 400
-    try:
-        temp_f = float(temp)
-    except (TypeError, ValueError):
-        return jsonify({"error": "temperature must be a number"}), 400
-    data, code = _safe(ctrl._pw_thread.call, ctrl.set_setpoint, temp_f, None)
-    return jsonify(data), code
+    return _handle_setpoint(None)
 
 
 @app.route("/mode", methods=["POST"])
 @app.route("/regulation_mode", methods=["POST"])
 def mode():
-    m = (request.get_json(silent=True) or {}).get("mode", "")
-    if not m:
-        return jsonify({"error": "missing mode"}), 400
-    if m not in (MAIN_MODES | REG_MODES):
-        return jsonify({"error": f"invalid mode: {m}"}), 400
-    data, code = _safe(ctrl._pw_thread.call, ctrl.set_mode, m, None)
-    return jsonify(data), code
+    return _handle_mode(None)
 
 
 @app.route("/on", methods=["POST"])
 def turn_on():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_on, None)
-    return jsonify(data), code
+    return _handle_power(None, True)
 
 
 @app.route("/off", methods=["POST"])
 def turn_off():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.turn_off, None)
-    return jsonify(data), code
+    return _handle_power(None, False)
 
 
 @app.route("/filtration/start", methods=["POST"])
 def filtration_start():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.start_filtration, None)
-    return jsonify(data), code
+    return _handle_filtration(None, True)
 
 
 @app.route("/filtration/stop", methods=["POST"])
 def filtration_stop():
-    data, code = _safe(ctrl._pw_thread.call, ctrl.stop_filtration, None)
-    return jsonify(data), code
+    return _handle_filtration(None, False)
 
 
 # ── Auth API routes (v2) ──────────────────────────────────────────────────────

@@ -260,8 +260,8 @@ _STATUS_JS = """
         // Fallback: body text ON/OFF indicator
         if (heatPumpActive === null) {
             const body = document.body.innerText;
-            if (/\bON\b/.test(body)) heatPumpActive = true;
-            else if (/\bOFF\b/.test(body)) heatPumpActive = false;
+            if (/\\bON\\b/.test(body)) heatPumpActive = true;
+            else if (/\\bOFF\\b/.test(body)) heatPumpActive = false;
         }
     }
 
@@ -299,18 +299,50 @@ _STATUS_JS = """
     }
 
     // ── Alarm / error ─────────────────────────────────────────────────────────
+    // Mirrors polyconnect_bridge/server.py — the banner is a vertical stack of
+    // three items:
+    //   [0] timestamp ("31/08/2026 20:28", "-" until the record loads)
+    //   [1] level row: icon (.alarm-icon-<level>) + label ("Info")
+    //   [2] message  ("Pas de débit d'eau (…)", empty until the text loads)
+    // Blazor renders those in stages and prints the raw resource key
+    // ("AlarmLevel_Info" → "ALARMLEVEL_INFO" once CSS uppercases it) while the
+    // translation is still loading, so read the parts individually, drop the
+    // placeholder/key-shaped ones, and report `alarmHydrated` — the caller
+    // re-reads instead of publishing a half-rendered banner.
+    const RESOURCE_KEY_RE = /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$/;
+    const alarmText = (el) => {
+        const txt = el ? (el.innerText || '').trim() : '';
+        if (!txt || txt === '-') return null;            // placeholder, data not loaded
+        if (RESOURCE_KEY_RE.test(txt)) return null;      // untranslated resource key
+        return txt;
+    };
+
     let alarmActive = false;
     let alarmMessage = null;
+    let alarmHydrated = true;
     {
         const banner = document.querySelector('.heat-pump-view-error-clickable');
         if (banner && banner.offsetParent !== null) {
-            const txt = banner.innerText.trim();
-            if (txt) { alarmActive = true; alarmMessage = txt; }
+            alarmActive = true;
+            const stack = banner.querySelector('.istd-ct-container');
+            const items = stack
+                ? Array.from(stack.children).filter(
+                      el => el.classList.contains('istd-ct-container-item'))
+                : [];
+            let dateTxt = null, levelTxt = null, msgTxt = null;
+            items.forEach((item, i) => {
+                const txt = alarmText(item);
+                if (item.querySelector('.istd-co-icon')) levelTxt = txt;  // level row
+                else if (i === 0)                        dateTxt  = txt;  // timestamp
+                else if (txt)                            msgTxt   = txt;  // message
+            });
+            alarmMessage  = [dateTxt, levelTxt, msgTxt].filter(Boolean).join('\\n') || null;
+            alarmHydrated = msgTxt !== null;
         }
         if (!alarmActive) {
             for (const el of document.querySelectorAll('[class*="alarm"], [class*="error-msg"], [class*="alert-msg"]')) {
                 if (el.offsetParent === null) continue;
-                const txt = el.innerText.trim();
+                const txt = alarmText(el);
                 if (txt && !el.classList.contains('device-summary-data-blocked-message')) {
                     alarmActive = true; alarmMessage = txt; break;
                 }
@@ -346,6 +378,7 @@ _STATUS_JS = """
         filtrationRunning:   filtrationRunning,
         alarmActive:         alarmActive,
         alarmMessage:        alarmMessage,
+        alarmHydrated:       alarmHydrated,
         cop:                 cop,
         powerConsumptionW:   powerConsumptionW,
         errorCode:           alarmActive ? 1 : 0,
@@ -357,6 +390,24 @@ _STATUS_JS = """
 class PolyconnectController:
     """Playwright-based controller (singleton, browser reused across requests)."""
 
+    # Mirrors polyconnect_bridge/server.py: a banner whose message is still
+    # empty means Blazor is mid-render — the timestamp and the level land
+    # before the translated text does. Waiting on this keeps a half-rendered
+    # banner from being published as the alarm message.
+    _ALARM_READY_JS = """() => {
+        const banner = document.querySelector('.heat-pump-view-error-clickable');
+        if (!banner || banner.offsetParent === null) return true;   // no alarm
+        const stack = banner.querySelector('.istd-ct-container');
+        if (!stack) return false;
+        const items = Array.from(stack.children).filter(
+            el => el.classList.contains('istd-ct-container-item'));
+        return items.some((item, i) =>
+            i > 0 && !item.querySelector('.istd-co-icon') &&
+            (item.innerText || '').trim().length > 0);
+    }"""
+
+    _ALARM_SETTLE_TIMEOUT_MS = 5_000   # extra wait when only the banner lags
+
     def __init__(self, token: str, heat_pump_id: str = DEFAULT_HEAT_PUMP_ID):
         self.token = token
         self.heat_pump_id = heat_pump_id
@@ -365,6 +416,7 @@ class PolyconnectController:
         self._browser = None
         self._context = None
         self._page = None
+        self._last_status: dict | None = None
 
     def _ensure_browser(self):
         if self._browser and self._browser.is_connected():
@@ -430,6 +482,7 @@ class PolyconnectController:
         except Exception:
             pass
         time.sleep(3.0)  # Extra wait for all data to populate
+        self._wait_for_alarm_banner()
 
     def _ensure_heat_pump_view(self):
         if "heat-pump-view" not in self._page.url:
@@ -447,6 +500,37 @@ class PolyconnectController:
             except Exception:
                 pass
             time.sleep(2.5)  # Allow data to populate
+            self._wait_for_alarm_banner()
+
+    def _wait_for_alarm_banner(self, timeout_ms: int | None = None) -> None:
+        """Block until the alarm banner is fully rendered (or absent)."""
+        try:
+            self._page.wait_for_function(
+                self._ALARM_READY_JS,
+                timeout=timeout_ms or self._ALARM_SETTLE_TIMEOUT_MS)
+        except Exception:
+            pass
+
+    def _scrape_status(self) -> dict:
+        """Evaluate _STATUS_JS, re-reading once if the alarm banner is still
+        rendering. When it refuses to finish, the last known message is kept
+        rather than replaced by a partial one — the banner proves the alarm is
+        still up, only its text is unread."""
+        data = self._page.evaluate(_STATUS_JS)
+        if data.get("alarmActive") and not data.get("alarmHydrated", True):
+            self._wait_for_alarm_banner()
+            data = self._page.evaluate(_STATUS_JS)
+            if not data.get("alarmHydrated", True):
+                prev_msg = (self._last_status or {}).get("alarmMessage")
+                print(f"[warn] alarm banner never finished rendering — "
+                      f"partial read {data.get('alarmMessage')!r}"
+                      + (f", keeping {prev_msg!r}" if prev_msg else ""),
+                      file=sys.stderr)
+                if prev_msg:
+                    data["alarmMessage"] = prev_msg
+        data.pop("alarmHydrated", None)   # internal flag, not part of the API
+        self._last_status = data
+        return data
 
     def get_status(self) -> dict:
         with self._lock:
@@ -454,8 +538,7 @@ class PolyconnectController:
             self._ensure_heat_pump_view()
             # Extra delay to ensure all async data has loaded
             time.sleep(1.5)
-            result = self._page.evaluate(_STATUS_JS)
-            return result
+            return self._scrape_status()
 
     def set_setpoint(self, temp: float):
         """Change the temperature setpoint using the round slider."""
@@ -608,8 +691,8 @@ class PolyconnectController:
                        btn.classList.contains('active');
             }
             const body = document.body.innerText;
-            if (/\bON\b/.test(body)) return true;
-            if (/\bOFF\b/.test(body)) return false;
+            if (/\\bON\\b/.test(body)) return true;
+            if (/\\bOFF\\b/.test(body)) return false;
             return null;
         })()
         """)
