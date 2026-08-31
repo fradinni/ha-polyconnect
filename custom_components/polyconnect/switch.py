@@ -50,9 +50,17 @@ class PolyconnectPowerSwitch(PolyconnectEntity, SwitchEntity):
         return bool(val)
 
     async def async_turn_on(self, **kwargs) -> None:
-        await self.coordinator.api.turn_on(self._pump_id)
-        await self.coordinator.async_request_refresh()
+        await self._set_power(True)
 
     async def async_turn_off(self, **kwargs) -> None:
-        await self.coordinator.api.turn_off(self._pump_id)
-        await self.coordinator.async_request_refresh()
+        await self._set_power(False)
+
+    async def _set_power(self, want_on: bool) -> None:
+        """Flip the power, then always resync so a failure cannot stick."""
+        self._optimistic_update("heatPumpActive", want_on)
+        api = self.coordinator.api
+        try:
+            await (api.turn_on(self._pump_id) if want_on
+                   else api.turn_off(self._pump_id))
+        finally:
+            await self.coordinator.async_request_refresh()

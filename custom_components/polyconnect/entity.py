@@ -51,3 +51,15 @@ class PolyconnectEntity(CoordinatorEntity[PolyconnectCoordinator]):
     def available(self) -> bool:
         """Entity is available only when coordinator has data for this pump."""
         return super().available and self._pump_data is not None
+
+    def _optimistic_update(self, key: str, value: Any) -> None:
+        """Mutate the cached status for this pump and push to HA immediately.
+
+        Callers must always follow up with ``async_request_refresh()`` — in a
+        ``finally`` block — so a rejected command does not leave this optimistic
+        value on screen.
+        """
+        data = self._pump_data
+        if data is not None:
+            data[key] = value
+            self.async_write_ha_state()
