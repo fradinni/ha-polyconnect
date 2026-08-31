@@ -70,7 +70,7 @@ ha-polyconnect/
 │   ├── Dockerfile
 │   ├── requirements.txt             # flask, playwright
 │   └── run.sh
-├── docs/                            # API reverse-engineering notes
+├── docs/                            # User-facing docs (README only)
 ├── scripts/
 │   ├── run-local-bridge-server.sh       # start bridge locally with captured credentials
 │   ├── capture/                     # MITM tools for extracting auth tokens & device IDs
@@ -107,4 +107,3 @@ ha-polyconnect/
 
 ## Security Notes
 - Never commit `scripts/capture/captured_token.txt` (gitignored). Tokens are short-lived JWTs.
-- `docs/` contains embedded APK credentials from reverse engineering — do not redistribute.

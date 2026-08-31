@@ -4,7 +4,7 @@
 Features:
 - Persistent Chromium instance for controlling Polyconnect heat pumps
 - Native email/password authentication against auth.pool.mytech-connect.io
-  (no more mitmproxy capture — see docs/native-login.md)
+  (no more mitmproxy capture)
 - Credentials stored in /data/ (persistent across add-on updates)
 
 Ports:
@@ -525,7 +525,7 @@ class PolyconnectController:
     def _discover_ids(self) -> list[dict]:
         """Auto-discover installation_id + the full list of heat pumps from the SPA.
 
-        Strategy (verified empirically — see docs/native-login.md §8):
+        Strategy (verified empirically):
           1. /from-native/<token> already loaded; SPA auto-routes to
              /installation-overview/<installation_id>.
           2. Pluck installation_id from the URL.

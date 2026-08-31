@@ -29,7 +29,6 @@ MANIFEST="$ROOT/custom_components/polyconnect/manifest.json"
 ADDON_CONFIG="$ROOT/polyconnect_bridge/config.yaml"
 SERVER_PY="$ROOT/polyconnect_bridge/server.py"
 README="$ROOT/docs/README.md"
-API_REF="$ROOT/docs/api-reference.md"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -110,9 +109,7 @@ bump_bridge() {
     sed -i "s/^BRIDGE_VERSION = \"[^\"]*\"/BRIDGE_VERSION = \"$new_ver\"/" "$SERVER_PY"
     # docs/README.md — bridge line, discriminated by "Ports"
     sed -i "s|\(\*\*Version:\*\* \)[0-9]\+\.[0-9]\+\.[0-9]\+\( · \*\*Ports:\*\*\)|\1$new_ver\2|" "$README"
-    # docs/api-reference.md — /health example response
-    sed -i "s/\(\"version\": \"\)[0-9]\+\.[0-9]\+\.[0-9]\+\(\",\)/\1$new_ver\2/" "$API_REF"
-    echo "  ✓ bridge: $current → $new_ver  ($ADDON_CONFIG, $SERVER_PY, $README, $API_REF)"
+    echo "  ✓ bridge: $current → $new_ver  ($ADDON_CONFIG, $SERVER_PY, $README)"
 }
 
 # Grep for any stale version references anywhere in the tree.

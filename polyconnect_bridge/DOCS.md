@@ -83,7 +83,5 @@ All state lives under `/data/` (persistent across add-on updates):
 
 ## API
 
-The bridge exposes a REST API on port 8765 (via ingress). See
-[`docs/api-reference.md`](https://github.com/fradinni/ha-polyconnect/blob/main/docs/api-reference.md)
-in the repository for the full endpoint list. Typical usage goes through the HA
-integration, not direct API calls.
+The bridge exposes a REST API on port 8765 (via ingress). Typical usage goes
+through the HA integration, not direct API calls.

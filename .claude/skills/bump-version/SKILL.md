@@ -24,7 +24,7 @@ Present the output to the user so they can see what's currently deployed.
 Ask the user which component(s) to bump using the `question` tool:
 
 - **Integration** — the HA custom component (`custom_components/polyconnect/manifest.json` + `docs/README.md`)
-- **Bridge** — the Supervisor add-on (`polyconnect_bridge/config.yaml` + `server.py` + `docs/README.md` + `docs/api-reference.md`)
+- **Bridge** — the Supervisor add-on (`polyconnect_bridge/config.yaml` + `server.py` + `docs/README.md`)
 - **Both** — bump both components
 
 **Files touched per component** (kept in sync by `scripts/bump-version.sh`):
@@ -32,7 +32,7 @@ Ask the user which component(s) to bump using the `question` tool:
 | Component | Files |
 |---|---|
 | integration | `custom_components/polyconnect/manifest.json` — `"version": "..."`<br>`docs/README.md` — `**Version:** X.Y.Z · **IoT class:**` line |
-| bridge | `polyconnect_bridge/config.yaml` — `version: "..."`<br>`polyconnect_bridge/server.py` — `BRIDGE_VERSION = "..."`<br>`docs/README.md` — `**Version:** X.Y.Z · **Ports:**` line<br>`docs/api-reference.md` — `"version": "..."` in the /health example response |
+| bridge | `polyconnect_bridge/config.yaml` — `version: "..."`<br>`polyconnect_bridge/server.py` — `BRIDGE_VERSION = "..."`<br>`docs/README.md` — `**Version:** X.Y.Z · **Ports:**` line |
 
 **If you ever hardcode a new version string** somewhere else (a new doc, a log message, an env default), add it to the corresponding `bump_integration()` / `bump_bridge()` function in `scripts/bump-version.sh` — otherwise it will drift on the next bump.
 

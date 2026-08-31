@@ -1,10 +1,10 @@
 """Polyconnect native authentication — replaces the v1 mitmproxy capture flow.
 
 Replicates the .NET MAUI app's signed-transaction wire format against
-`auth.pool.mytech-connect.io`. See docs/native-login.md for the full protocol
-breakdown. The protocol details live here; the lifecycle below wraps them in
-the same `Credentials` shape the rest of the bridge already consumes, so
-swapping CaptureManager → AuthManager is a one-line change in server.py.
+`auth.pool.mytech-connect.io`. The protocol details live here; the lifecycle
+below wraps them in the same `Credentials` shape the rest of the bridge
+already consumes, so swapping CaptureManager → AuthManager is a one-line
+change in server.py.
 
 Public API (parity with v1 CaptureManager):
   - mgr.credentials                  -> Credentials dataclass (.token, .installation_id,
