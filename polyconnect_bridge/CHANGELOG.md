@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.3.0
+
+- **Write commands are now verified.** Setpoint, mode, on/off and
+  filtration re-read the page until the change is observed, instead of
+  always answering `ok: true`. A control that is missing or refused now
+  returns an error (HTTP 409 when the pump is off, 500 otherwise) so Home
+  Assistant reports a real command failure.
+- Verification runs on the `/pumps/<id>/...` routes the integration
+  actually calls, not just the legacy single-pump aliases — both families
+  now share the same handlers.
+- Fix the power toggle: click `#heat-pump-on-off` first and log every
+  failed selector. Previously all click exceptions were swallowed and the
+  command reported success without doing anything.
+- Fix setpoint drags: wait for the round slider to be enabled and for its
+  handle to stop animating, and retry the drag up to 3 times. A mode
+  change followed by a setpoint no longer fails.
+- Fix the alarm sensor alternating between the real message and
+  `ALARMLEVEL_INFO`: the banner is parsed per item, untranslated resource
+  keys are dropped, and navigation waits for the banner to hydrate.
+- An expired session during a write surfaces as `401 auth_expired` again
+  instead of a misleading timeout, so re-authentication is triggered.
+- New `/debug/onoff` and `/debug/setpoint` diagnostic routes.
+
 ## 2.2.0
 
 - **Breaking config change:** removed `heat_pump_id` and `installation_id`
