@@ -191,16 +191,44 @@ STATUS_JS = """
             filtrationRunning = true;
     }
 
-    let alarmActive = false, alarmMessage = null;
+    // Alarm — mirrors polyconnect_bridge/server.py: the banner is a vertical
+    // stack of [timestamp, level row (icon + label), message] that Blazor
+    // renders in stages, printing the raw resource key ("AlarmLevel_Info" →
+    // "ALARMLEVEL_INFO" once CSS uppercases it) while the translation loads.
+    // Read the parts individually, drop the placeholder/key-shaped ones, and
+    // report `alarmHydrated` so the caller can re-read instead of publishing a
+    // half-rendered banner.
+    const RESOURCE_KEY_RE = /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$/;
+    const alarmText = (el) => {
+        const txt = el ? (el.innerText || '').trim() : '';
+        if (!txt || txt === '-') return null;            // placeholder, data not loaded
+        if (RESOURCE_KEY_RE.test(txt)) return null;      // untranslated resource key
+        return txt;
+    };
+
+    let alarmActive = false, alarmMessage = null, alarmHydrated = true;
     const banner = document.querySelector('.heat-pump-view-error-clickable');
     if (banner && banner.offsetParent !== null) {
-        const txt = banner.innerText.trim();
-        if (txt) { alarmActive = true; alarmMessage = txt; }
+        alarmActive = true;
+        const stack = banner.querySelector('.istd-ct-container');
+        const items = stack
+            ? Array.from(stack.children).filter(
+                  el => el.classList.contains('istd-ct-container-item'))
+            : [];
+        let dateTxt = null, levelTxt = null, msgTxt = null;
+        items.forEach((item, i) => {
+            const txt = alarmText(item);
+            if (item.querySelector('.istd-co-icon')) levelTxt = txt;  // level row
+            else if (i === 0)                        dateTxt  = txt;  // timestamp
+            else if (txt)                            msgTxt   = txt;  // message
+        });
+        alarmMessage  = [dateTxt, levelTxt, msgTxt].filter(Boolean).join('\\n') || null;
+        alarmHydrated = msgTxt !== null;
     }
     if (!alarmActive) {
         for (const el of document.querySelectorAll('[class*="alarm"], [class*="error-msg"]')) {
             if (el.offsetParent === null) continue;
-            const txt = el.innerText.trim();
+            const txt = alarmText(el);
             if (txt && !el.classList.contains('device-summary-data-blocked-message')) {
                 alarmActive = true; alarmMessage = txt; break;
             }
@@ -218,10 +246,60 @@ STATUS_JS = """
         filtrationRunning:   filtrationRunning,
         alarmActive:         alarmActive,
         alarmMessage:        alarmMessage,
+        alarmHydrated:       alarmHydrated,
         errorCode:           alarmActive ? 1 : 0,
     };
 }
 """
+
+# Alarm-banner readiness — kept separate so it can gate DATA_READY_JS and be
+# re-waited on after a scrape that landed mid-render.
+ALARM_READY_JS = """() => {
+    const banner = document.querySelector('.heat-pump-view-error-clickable');
+    if (!banner || banner.offsetParent === null) return true;   // no alarm
+    const stack = banner.querySelector('.istd-ct-container');
+    if (!stack) return false;
+    const items = Array.from(stack.children).filter(
+        el => el.classList.contains('istd-ct-container-item'));
+    return items.some((item, i) =>
+        i > 0 && !item.querySelector('.istd-co-icon') &&
+        (item.innerText || '').trim().length > 0);
+}"""
+
+DATA_READY_JS = """() => {
+    const sp = document.querySelector('.order-and-value-order-number');
+    const w  = document.querySelector('.topbar-weather');
+    const g  = document.querySelector('.co-gauge-container');
+    if (!g) return false;
+    if (!(__ALARM_READY__)()) return false;
+    if (sp && sp.textContent.trim()) return true;
+    if (w && w.textContent.trim()) return true;
+    return false;
+}""".replace("__ALARM_READY__", ALARM_READY_JS)
+
+ALARM_SETTLE_TIMEOUT_MS = 5_000   # extra wait when only the banner lags
+
+
+def scrape_status(page, prev: dict | None = None) -> dict:
+    """Evaluate STATUS_JS, re-reading once if the alarm banner is still
+    rendering. When it refuses to finish, the last known message is kept rather
+    than replaced by a partial one."""
+    data = page.evaluate(STATUS_JS)
+    if data.get("alarmActive") and not data.get("alarmHydrated", True):
+        try:
+            page.wait_for_function(ALARM_READY_JS, timeout=ALARM_SETTLE_TIMEOUT_MS)
+        except Exception:
+            pass
+        data = page.evaluate(STATUS_JS)
+        if not data.get("alarmHydrated", True):
+            prev_msg = (prev or {}).get("alarmMessage")
+            print(f"  [warn] alarm banner never finished rendering — partial read "
+                  f"{data.get('alarmMessage')!r}"
+                  + (f", keeping {prev_msg!r}" if prev_msg else ""))
+            if prev_msg:
+                data["alarmMessage"] = prev_msg
+    data.pop("alarmHydrated", None)   # internal flag, not part of the API
+    return data
 
 
 class C:
@@ -404,6 +482,7 @@ def main() -> None:
     print(f"\n  {C.DIM}Polling every {args.interval}s. Press Ctrl+C to stop.{C.RESET}")
 
     poll_num = 0
+    prev_data: dict | None = None
     try:
         while browser.is_connected():
             poll_num += 1
@@ -433,18 +512,7 @@ def main() -> None:
                 except Exception:
                     pass
                 try:
-                    page.wait_for_function(
-                        "() => {"
-                        "  const sp = document.querySelector('.order-and-value-order-number');"
-                        "  const w  = document.querySelector('.topbar-weather');"
-                        "  const g  = document.querySelector('.co-gauge-container');"
-                        "  if (!g) return false;"
-                        "  if (sp && sp.textContent.trim()) return true;"
-                        "  if (w && w.textContent.trim()) return true;"
-                        "  return false;"
-                        "}",
-                        timeout=6_000,
-                    )
+                    page.wait_for_function(DATA_READY_JS, timeout=6_000)
                 except Exception:
                     pass
 
@@ -453,7 +521,8 @@ def main() -> None:
                     print(f"\n  {C.RED}[ERROR] Token expired mid-session!{C.RESET}")
                     break
 
-                data = page.evaluate(STATUS_JS)
+                data = scrape_status(page, prev_data)
+                prev_data = data
                 elapsed = (time.time() - t_start) * 1000
                 print_poll(data, elapsed, poll_num)
 
