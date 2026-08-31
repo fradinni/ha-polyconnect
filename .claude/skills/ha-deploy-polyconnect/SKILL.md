@@ -12,12 +12,12 @@ Interactive, two-path deployer for the bridge add-on (`polyconnect_bridge/`) and
 | Component | Local source | GitHub-installed slug | SSH target path |
 |---|---|---|---|
 | Bridge add-on | `polyconnect_bridge/` | `ecbbef75_polyconnect_bridge` | `/addons/polyconnect_bridge/` → `local_polyconnect_bridge` |
-| Integration | `custom_components/polyconnect/` | HACS `fradinni/ha-polyconnect`, domain `polyconnect` | `/config/custom_components/polyconnect/` |
+| Integration | `custom_components/polyconnect/` | HACS `<github-user>/ha-polyconnect`, domain `polyconnect` | `/config/custom_components/polyconnect/` |
 
 | Constant | Value |
 |---|---|
-| HA host | `nicolas@192.168.1.11` |
-| SSH key | `~/.ssh/ed25519_fradinni_gmail_com` |
+| HA host | `<user>@<ha-host>` |
+| SSH key | `~/.ssh/<key>` |
 | GitHub repo | `https://github.com/fradinni/ha-polyconnect` |
 
 ## Step 1 — Ask what to deploy
@@ -107,14 +107,14 @@ Skip the HA restart if HACS reports the same version (no-op).
 
 ### B.0 Ensure write permissions (one-time setup, idempotent)
 
-The `nicolas` user (uid 1000) inside the SSH addon **cannot write** to `/addons/` or `/homeassistant/` by default — both are root:root 755. Fix this via the SSH addon's `init_commands` (run as root on each addon start):
+The `<user>` user (uid 1000) inside the SSH addon **cannot write** to `/addons/` or `/homeassistant/` by default — both are root:root 755. Fix this via the SSH addon's `init_commands` (run as root on each addon start):
 
 ```
 ha_manage_addon(
     slug="a0d7b954_ssh",
     options={"init_commands": [
-        "mkdir -p /addons/polyconnect_bridge && chown -R nicolas:nicolas /addons/polyconnect_bridge",
-        "chown -R nicolas:nicolas /homeassistant/custom_components/polyconnect"
+        "mkdir -p /addons/polyconnect_bridge && chown -R <user>:<user> /addons/polyconnect_bridge",
+        "chown -R <user>:<user> /homeassistant/custom_components/polyconnect"
     ]}
 )
 ha_manage_addon(action="restart", slug="a0d7b954_ssh")
@@ -123,7 +123,7 @@ ha_manage_addon(action="restart", slug="a0d7b954_ssh")
 Check whether these init_commands are already configured before re-applying. If they're already there, skip this step (the chown is idempotent anyway). Verify with:
 
 ```bash
-ssh -i ~/.ssh/ed25519_fradinni_gmail_com nicolas@192.168.1.11 \
+ssh -i ~/.ssh/<key> <user>@<ha-host> \
   "touch /addons/polyconnect_bridge/.test && rm /addons/polyconnect_bridge/.test && echo OK"
 ```
 
@@ -150,16 +150,16 @@ The directory `/addons/polyconnect_bridge/` is created with correct ownership by
 
 ```bash
 rsync -av --delete \
-  -e "ssh -i ~/.ssh/ed25519_fradinni_gmail_com" \
+  -e "ssh -i ~/.ssh/<key>" \
   --exclude '__pycache__' --exclude '*.pyc' \
   polyconnect_bridge/ \
-  nicolas@192.168.1.11:/addons/polyconnect_bridge/
+  <user>@<ha-host>:/addons/polyconnect_bridge/
 ```
 
 Then reload the Supervisor add-on store so it discovers `local_polyconnect_bridge`. The `hassio.addon_reload` service requires an `entity_id` we don't have, so use the CLI via SSH:
 
 ```bash
-ssh -i ~/.ssh/ed25519_fradinni_gmail_com nicolas@192.168.1.11 \
+ssh -i ~/.ssh/<key> <user>@<ha-host> \
   "TOKEN=\$(grep SUPERVISOR_TOKEN /etc/profile.d/*.sh | head -1 | sed -E 's/.*\"(.*)\".*/\\1/'); \
    ha store reload --api-token \"\$TOKEN\""
 ```
@@ -202,10 +202,10 @@ The HA host's `/config` is a symlink to `/homeassistant`. Use `/homeassistant/cu
 
 ```bash
 rsync -av --delete \
-  -e "ssh -i ~/.ssh/ed25519_fradinni_gmail_com" \
+  -e "ssh -i ~/.ssh/<key>" \
   --exclude '__pycache__' --exclude '*.pyc' \
   custom_components/polyconnect/ \
-  nicolas@192.168.1.11:/homeassistant/custom_components/polyconnect/
+  <user>@<ha-host>:/homeassistant/custom_components/polyconnect/
 ```
 
 Integration Python modules are cached in `sys.modules`. After rsync, **`reload_config_entry` is NOT enough** — it reloads entry config, not the Python code. A full HA restart is required:
@@ -237,7 +237,7 @@ If addon or integration is in error: fetch error_log and surface to user.
 
 Quick bridge sanity check via SSH:
 ```bash
-ssh -i ~/.ssh/ed25519_fradinni_gmail_com nicolas@192.168.1.11 \
+ssh -i ~/.ssh/<key> <user>@<ha-host> \
   "curl -s http://172.30.33.2:8765/health; echo; \
    curl -s http://172.30.33.2:8765/pumps"
 ```
@@ -260,7 +260,7 @@ Single short message:
 - **Bridge needs `rebuild`, not `restart`**: the addon Dockerfile uses `COPY . /app/` at build time. `restart` just restarts the container from the cached image with the OLD code. Always `rebuild` after rsync.
 - **Integration needs full HA restart**: `reload_config_entry` does NOT reimport Python modules (sys.modules is cached). Without restart, the new files are on disk but the old code keeps running.
 - **HACS doesn't notice direct overwrites** of `/config/custom_components/polyconnect/`. To revert: `ha_manage_hacs(action="download", repository_id="fradinni/ha-polyconnect")` redownloads the tracked version.
-- **SSH addon runs as `nicolas` (uid 1000), not root** — Step B.0 fixes this once via `init_commands` on the SSH addon. After that, deploys are fast.
+- **SSH addon runs as `<user>` (uid 1000), not root** — Step B.0 fixes this once via `init_commands` on the SSH addon. After that, deploys are fast.
 - **Bridge install timeout**: `ha_manage_addon(action="install", slug="local_polyconnect_bridge")` builds Chromium and can take 3-5 minutes. The MCP call may report timeout while the build continues — poll `ha_get_addon` until `installed: true` rather than failing the deploy.
 - **Branch `v2-native-login` is NOT `main`**: path A from this branch needs either `git push origin v2-native-login:main` (force) or a merge first. Surface this to the user before doing it.
-- **SSH key**: the addon's `authorized_keys` must contain `~/.ssh/ed25519_fradinni_gmail_com.pub`. If `ssh nicolas@192.168.1.11 echo OK` fails, fix the addon options before proceeding.
+- **SSH key**: the addon's `authorized_keys` must contain `~/.ssh/<key>.pub`. If `ssh <user>@<ha-host> echo OK` fails, fix the addon options before proceeding.
