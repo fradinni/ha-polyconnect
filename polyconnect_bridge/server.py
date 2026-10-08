@@ -64,7 +64,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("polyconnect")
 
-BASE     = "https://polytropic.user-app.pool.mytech-connect.io"
+BASE     = None  # Initialized from the authenticated session
 CF       = {"CF-Access-Client-Id": "zLT6DV", "CF-Access-Client-Secret": "NEEJ9S"}
 AFFINITY = {"name": "affinity",
             "value": "382f2696aa3d7505ba3d20a0b6b549f9|dc028cea65244b463811c834d3033c89",
@@ -424,7 +424,7 @@ class PolyconnectController:
         self._ctx     = self._browser.new_context(
             extra_http_headers=CF, user_agent=UA,
             viewport={"width": 390, "height": 844}, locale="fr-FR")
-        self._ctx.add_cookies([AFFINITY])
+        # Legacy affinity cookie is not valid for the server-provided origin.
         self._page    = self._ctx.new_page()
         try:
             self._load_app()
@@ -445,9 +445,18 @@ class PolyconnectController:
         On first boot (no pumps discovered yet) enumerate all pumps from
         the installation-overview page. Leaves the page on /heat-pump-view/<first_pump>.
         """
-        token = _get_token()
+        global BASE
+        from urllib.parse import urlsplit
+        app_url = _auth_mgr.get_app_url()
+        if not app_url:
+            raise RuntimeError("No authenticated application URL")
+        parsed = urlsplit(app_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise RuntimeError("Invalid authenticated application URL")
+        BASE = f"{parsed.scheme}://{parsed.netloc}"
         page = self._page
-        page.goto(f"{BASE}/from-native/{token}", wait_until="domcontentloaded", timeout=30_000)
+        log.info("Loading Polyconnect application from %s", BASE)
+        page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
         try:
             page.wait_for_function(
                 "() => typeof Blazor !== 'undefined' && Blazor._internal",
