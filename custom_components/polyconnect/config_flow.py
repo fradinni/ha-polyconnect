@@ -9,7 +9,16 @@ from homeassistant.helpers.selector import (
     NumberSelector, NumberSelectorConfig,
 )
 
-from .const import DOMAIN, CONF_BRIDGE_URL, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, LOGGER
+from .const import (
+    CONF_BRIDGE_URL,
+    CONF_LANGUAGE,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    LANGUAGE_OPTIONS,
+    LOGGER,
+    get_language,
+)
 
 ADDON_SLUG_SUFFIX = "polyconnect_bridge"
 ADDON_DEFAULT_URL = "http://homeassistant.local:8765"
@@ -139,5 +148,9 @@ class PolyconnectOptionsFlow(OptionsFlow):
                 ): NumberSelector(
                     NumberSelectorConfig(min=1, max=60, step=1, mode="box", unit_of_measurement="min")
                 ),
+                vol.Optional(
+                    CONF_LANGUAGE,
+                    default=get_language(current),
+                ): vol.In(LANGUAGE_OPTIONS),
             }),
         )

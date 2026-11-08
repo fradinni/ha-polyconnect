@@ -88,11 +88,15 @@ The integration recovers automatically once new credentials are captured.
 
 ## Options
 
-| Setting       | Default | Range    | Description                             |
-| ------------- | ------- | -------- | --------------------------------------- |
-| Scan interval | 1 min   | 1–60 min | How often to poll the bridge for status |
+| Setting                 | Default | Options  | Description                                    |
+| ----------------------- | ------- | -------- | ---------------------------------------------- |
+| Scan interval           | 1 min   | 1–60 min | How often to poll the bridge for status        |
+| Operating mode language | French  | FR / EN  | Language used for operating-mode sensor values |
 
 Configure in **Settings → Devices & Services → Polyconnect → Configure**.
+
+The language option changes displayed sensor values only. Commands sent to the
+heat pump remain in French, as required by the Polyconnect application.
 
 ---
 
