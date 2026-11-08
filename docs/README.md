@@ -143,9 +143,10 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 
 ### Options
 
-| Option | Default | Range | Description |
-|--------|---------|-------|-------------|
+| Option | Default | Values | Description |
+|--------|---------|--------|-------------|
 | Scan interval | 1 min | 1–60 min | How often to poll the bridge for status |
+| Operating mode language | French | French / English | Language used for operating-mode sensor values; device commands remain in French |
 
 ---
 

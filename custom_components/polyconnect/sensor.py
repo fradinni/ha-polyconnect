@@ -19,6 +19,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .entity import PolyconnectEntity
 from .coordinator import PolyconnectCoordinator
+from .const import get_language, translate_operating_mode
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -87,7 +88,13 @@ async def async_setup_entry(
     """Set up Polyconnect sensor entities — one of each per discovered pump."""
     coordinator: PolyconnectCoordinator = entry.runtime_data
     async_add_entities(
-        PolyconnectSensor(coordinator, pump["id"], pump["name"], desc)
+        PolyconnectSensor(
+            coordinator,
+            pump["id"],
+            pump["name"],
+            desc,
+            get_language(entry.options),
+        )
         for pump in coordinator.pumps
         for desc in SENSORS
     )
@@ -102,13 +109,21 @@ class PolyconnectSensor(PolyconnectEntity, SensorEntity):
         pump_id: str,
         pump_name: str,
         description: PolyconnectSensorDescription,
+        language: str,
     ) -> None:
         super().__init__(coordinator, pump_id, pump_name, description.key)
         self.entity_description = description
+        self._language = language
 
     @property
     def native_value(self) -> float | str | None:
         data = self._pump_data
         if not data:
             return None
-        return data.get(self.entity_description.data_key)
+
+        value = data.get(self.entity_description.data_key)
+
+        if self.entity_description.data_key == "operatingMode" and isinstance(value, str):
+            return translate_operating_mode(value, self._language)
+
+        return value
