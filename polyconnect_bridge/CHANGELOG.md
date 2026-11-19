@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.1
+
+- **Polyconnect v9 login URL.** Declare application version `9.0` and load the
+  application from the URL returned by the login response. The legacy host now
+  serves an "update required" page, which broke session loading and heat-pump
+  discovery (`Blazor is not defined`, `Could not find installation_id`).
+- Sessions persisted by an older bridge still point at the legacy host. When
+  the loaded page does not render the SPA (or reports an auth failure), the
+  bridge logs in again and reloads once, so upgrading needs no manual refresh.
+- Drop the legacy domain affinity cookie; the v9 origin sets its own.
+- Compare mode labels ignoring case and accents, so the v9 `ÉCO` label works
+  for regulation mode writes and status reporting.
+- Detect a setpoint drag that moves away from the target and reverse it on the
+  next attempt (v9 rotates/scales the gauge).
+
 ## 2.3.0
 
 - **Write commands are now verified.** Setpoint, mode, on/off and

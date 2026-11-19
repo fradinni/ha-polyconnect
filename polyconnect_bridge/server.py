@@ -13,12 +13,13 @@ Ports:
 from __future__ import annotations
 
 import math, os, logging, queue, threading, time, json, sys, re
+from urllib.parse import urlsplit
 from flask import Flask, jsonify, request, Response
 from pathlib import Path
 
 from auth import AuthManager, DATA_DIR
 
-BRIDGE_VERSION = "2.3.0"
+BRIDGE_VERSION = "2.3.1"
 
 # ── Auth manager (replaces v1 CaptureManager) ─────────────────────────────────
 _auth_mgr = AuthManager()
@@ -64,12 +65,8 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("polyconnect")
 
-BASE     = None  # Initialized from the authenticated session
+BASE: str | None = None  # Initialized from the authenticated session
 CF       = {"CF-Access-Client-Id": "zLT6DV", "CF-Access-Client-Secret": "NEEJ9S"}
-AFFINITY = {"name": "affinity",
-            "value": "382f2696aa3d7505ba3d20a0b6b549f9|dc028cea65244b463811c834d3033c89",
-            "domain": "polytropic.user-app.pool.mytech-connect.io",
-            "path": "/", "sameSite": "Lax"}
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148")
 
@@ -122,6 +119,11 @@ _STATUS_JS = """
         return isNaN(n) ? null : n;
     };
     const textOf = (el) => el ? el.textContent.trim() : null;
+    // Compare labels ignoring case and accents: v9 renders "ÉCO", "CHAUFFAGE".
+    const norm = (s) => (s || '').normalize('NFD')
+        .replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();
+    const findMode = (txt, modes) =>
+        modes.find(m => norm(m) === norm(txt)) || null;
 
     // Water temperature
     let waterTemp = null;
@@ -167,16 +169,16 @@ _STATUS_JS = """
     const MAIN_MODES = ['Chauffage', 'Froid', 'Automatique'];
     let operatingMode = null;
     for (const el of document.querySelectorAll('.state-button-value, [class*="mode-label"]')) {
-        const txt = el.textContent.trim();
-        if (MAIN_MODES.includes(txt)) { operatingMode = txt; break; }
+        const matched = findMode(el.textContent, MAIN_MODES);
+        if (matched) { operatingMode = matched; break; }
     }
     if (!operatingMode) {
         for (const el of document.querySelectorAll(
             '.heat-pump-view-mode-items [class*="selected"] button, ' +
             '.heat-pump-view-mode-items button[class*="active"]'
         )) {
-            const txt = el.textContent.trim();
-            if (MAIN_MODES.includes(txt)) { operatingMode = txt; break; }
+            const matched = findMode(el.textContent, MAIN_MODES);
+            if (matched) { operatingMode = matched; break; }
         }
     }
     if (!operatingMode) {
@@ -193,16 +195,16 @@ _STATUS_JS = """
         }
     }
     if (!operatingMode) {
-        const body = document.body.innerText;
-        for (const m of MAIN_MODES) { if (body.includes(m)) { operatingMode = m; break; } }
+        const body = norm(document.body.innerText);
+        for (const m of MAIN_MODES) { if (body.includes(norm(m))) { operatingMode = m; break; } }
     }
 
     // Regulation mode
     const REG_MODES = ['Eco', 'Smart', 'Boost'];
     let regulationMode = null;
     for (const el of document.querySelectorAll('.state-button-value, [class*="power-mode"]')) {
-        const txt = el.textContent.trim();
-        if (REG_MODES.includes(txt)) { regulationMode = txt; break; }
+        const matched = findMode(el.textContent, REG_MODES);
+        if (matched) { regulationMode = matched; break; }
     }
     if (!regulationMode) {
         const iconMap = {
@@ -218,8 +220,8 @@ _STATUS_JS = """
         }
     }
     if (!regulationMode) {
-        const body = document.body.innerText;
-        for (const m of REG_MODES) { if (body.includes(m)) { regulationMode = m; break; } }
+        const body = norm(document.body.innerText);
+        for (const m of REG_MODES) { if (body.includes(norm(m))) { regulationMode = m; break; } }
     }
 
     // Heat pump on/off
@@ -446,37 +448,49 @@ class PolyconnectController:
         the installation-overview page. Leaves the page on /heat-pump-view/<first_pump>.
         """
         global BASE
-        from urllib.parse import urlsplit
-        app_url = _auth_mgr.get_app_url()
-        if not app_url:
-            raise RuntimeError("No authenticated application URL")
-        parsed = urlsplit(app_url)
-        if parsed.scheme != "https" or not parsed.netloc:
-            raise RuntimeError("Invalid authenticated application URL")
-        BASE = f"{parsed.scheme}://{parsed.netloc}"
         page = self._page
-        log.info("Loading Polyconnect application from %s", BASE)
-        page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
-        try:
-            page.wait_for_function(
-                "() => typeof Blazor !== 'undefined' && Blazor._internal",
-                timeout=20_000)
-        except Exception:
-            pass
-        try:
-            page.wait_for_function(
-                "() => document.body.innerText.trim().length > 10",
-                timeout=8_000)
-        except Exception:
-            pass
-        body = page.evaluate("() => document.body.innerText.substring(0, 200)")
-        if "403" in body or "must be connected" in body.lower():
-            # v2: silently re-login. Caller's _ensure() will relaunch with a fresh token.
-            log.warning("Session token expired — refreshing …")
+
+        # The authenticated session carries the application entry point (v9
+        # moved it to a new host). A session persisted by an older bridge can
+        # still point at the legacy host, which now serves an "update required"
+        # page instead of the SPA. In that case, log in again and reload once.
+        for attempt in (1, 2):
+            app_url = _auth_mgr.get_app_url()
+            if not app_url:
+                raise RuntimeError("No authenticated application URL")
+            parsed = urlsplit(app_url)
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise RuntimeError("Invalid authenticated application URL")
+            BASE = f"{parsed.scheme}://{parsed.netloc}"
+            log.info("Loading Polyconnect application from %s", BASE)
+            page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                page.wait_for_function(
+                    "() => typeof Blazor !== 'undefined' && Blazor._internal",
+                    timeout=20_000)
+            except Exception:
+                pass
+            try:
+                page.wait_for_function(
+                    "() => document.body.innerText.trim().length > 10",
+                    timeout=8_000)
+            except Exception:
+                pass
+            body = page.evaluate("() => document.body.innerText.substring(0, 200)")
+            lowered = body.lower()
+            rejected = ("403" in body or "must be connected" in lowered
+                        or "authentication failed" in lowered)
+            rendered = page.evaluate(
+                "() => typeof Blazor !== 'undefined' && !!Blazor._internal")
+            if not rejected and rendered:
+                break
+            reason = "Session rejected" if rejected else "Application did not render"
+            log.warning("%s (%.80r) — refreshing …", reason, body)
             res = _auth_mgr.refresh()
             if not res.get("ok"):
-                raise RuntimeError(f"Session token expired and refresh failed: {res.get('error')}")
-            raise RuntimeError("Session token expired — refreshed, will retry")
+                raise RuntimeError(f"{reason} and refresh failed: {res.get('error')}")
+            if attempt == 2:
+                raise RuntimeError(f"{reason} after refreshing the session")
 
         # ── First-boot ID discovery ───────────────────────────────────────────
         pumps = _get_pumps()
@@ -945,8 +959,10 @@ class PolyconnectController:
 
             already = page.evaluate(
                 "(m => {"
+                "  const norm = (s) => (s || '').normalize('NFD')"
+                "    .replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();"
                 "  for (const el of document.querySelectorAll('button')) {"
-                "    if (el.textContent.trim() === m &&"
+                "    if (norm(el.textContent) === norm(m) &&"
                 "        (el.classList.contains('control-selected') || el.classList.contains('istd-sty-active')))"
                 "      return true;"
                 "  }"
@@ -956,17 +972,24 @@ class PolyconnectController:
                 log.info("Mode %s already selected — skipping click", mode)
             else:
                 clicked = False
-                try:
-                    page.click(f"button:has-text('{mode}')", timeout=3_000)
-                    clicked = True
-                    log.info("Clicked mode button: %s", mode)
-                except Exception:
-                    pass
+                # v9 localises labels in upper case and accents regulation modes
+                # ("ÉCO"); :has-text is case-insensitive but not accent-insensitive.
+                click_labels = ("ÉCO", "Eco") if mode == "Eco" else (mode,)
+                for label in click_labels:
+                    try:
+                        page.click(f"button:has-text('{label}')", timeout=2_000)
+                        clicked = True
+                        log.info("Clicked mode button: %s", label)
+                        break
+                    except Exception:
+                        continue
                 if not clicked:
                     page.evaluate(
                         "(m => {"
+                        "  const norm = (s) => (s || '').normalize('NFD')"
+                        "    .replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();"
                         "  for (const el of document.querySelectorAll('.control-selector button, button')) {"
-                        "    if (el.textContent.trim() === m &&"
+                        "    if (norm(el.textContent) === norm(m) &&"
                         "        !el.classList.contains('control-selected')) { el.click(); return true; }"
                         "  }"
                         "  return false;"
@@ -1108,6 +1131,10 @@ class PolyconnectController:
             if diff == 0:
                 return {"ok": True, "verified": True, "note": "already at target"}
 
+            # roundSlider can be rotated/scaled by the app's CSS. Rather than
+            # assuming a tangent direction, detect a drag that moves away from
+            # the target and reverse it on the next attempt.
+            direction = 1
             for attempt in range(1, 4):
                 if attempt > 1:
                     if not self._wait_slider_ready(_SLIDER_RETRY_TIMEOUT):
@@ -1139,7 +1166,8 @@ class PolyconnectController:
                 steps = max(20, abs(diff) * 5)
                 for i in range(steps + 1):
                     frac = i / steps
-                    page.mouse.move(hx + tx * move * frac, hy + ty * move * frac)
+                    page.mouse.move(hx + tx * move * frac * direction,
+                                    hy + ty * move * frac * direction)
                     time.sleep(0.015)
                 page.mouse.up()
                 time.sleep(0.6)
@@ -1148,6 +1176,11 @@ class PolyconnectController:
                 if now == target:
                     log.info("Setpoint slider reached %s on attempt %d", target, attempt)
                     break
+                if (now is not None and now != current
+                        and (target - current) * (now - current) < 0):
+                    direction = -direction
+                    log.info("Slider moved away from %s (now %r) — inverting drag direction",
+                             target, now)
                 log.warning("Setpoint drag attempt %d left slider at %r (target %s)",
                             attempt, now, target)
             else:
