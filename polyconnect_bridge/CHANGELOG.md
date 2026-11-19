@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.4.1
+
+- Detect pending Polyconnect Terms of Service acceptance (`/terms-of-service/0`)
+  and fail with an actionable message instead of the generic "Could not
+  auto-discover any heat pumps". `/health` exposes `tos_required`, the bridge
+  panel shows the message, and the HA integration surfaces it during setup.
+- Install `libatomic1` in the add-on image. Playwright's bundled Node driver
+  needs it before `playwright install --with-deps` can run.
+- Replace the outdated v1 credential-capture wording in the integration setup,
+  repair messages and documentation with the v2 email/password flow.
+
 ## 2.4.0
 
 - Version aligned with the integration 2.4.0 release. No bridge code changes

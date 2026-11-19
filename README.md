@@ -87,7 +87,7 @@ options. The integration reconnects automatically after a successful refresh.
 
 ### Terms of Service acceptance required
 
-If the bridge reports that Terms of Service acceptance is required, sign in to
+If the bridge reports **Terms of Service acceptance required**, sign in to
 the **official PolyConnect mobile app** with the same credentials and accept the
 terms there. Acceptance in the MyTech Connect app does not apply to the
 PolyConnect application endpoint. Then restart the bridge.
