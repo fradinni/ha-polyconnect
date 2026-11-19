@@ -57,7 +57,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 | `switch.py` | Power on/off switch |
 | `const.py` | All constants, mode mappings |
 
-**Version:** 2.3.0 · **IoT class:** `local_polling` · **Platforms:** sensor, climate, binary_sensor, switch
+**Version:** 2.4.0 · **IoT class:** `local_polling` · **Platforms:** sensor, climate, binary_sensor, switch
 
 ### Bridge Add-on (`polyconnect_bridge/`)
 
@@ -143,9 +143,13 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 
 ### Options
 
-| Option | Default | Range | Description |
-|--------|---------|-------|-------------|
+| Option | Default | Values | Description |
+|--------|---------|--------|-------------|
 | Scan interval | 1 min | 1–60 min | How often to poll the bridge for status |
+| Operating mode language | French¹ | French / English | Language used for operating-mode sensor values; device commands remain in French |
+
+¹ Existing installations default to French. New installations start in the
+Home Assistant UI language when it is French or English, otherwise French.
 
 ---
 

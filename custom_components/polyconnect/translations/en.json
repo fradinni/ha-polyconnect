@@ -28,7 +28,11 @@
       "init": {
         "title": "Polyconnect Options",
         "data": {
-          "scan_interval": "Scan Interval (minutes)"
+          "scan_interval": "Scan Interval (minutes)",
+          "language": "Operating Mode Language"
+        },
+        "data_description": {
+          "language": "Language used for operating-mode sensor values"
         }
       }
     }
