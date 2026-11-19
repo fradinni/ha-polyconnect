@@ -71,6 +71,10 @@ All state lives under `/data/` (persistent across add-on updates):
 
 **No heat pumps discovered**
 - Confirm the account has at least one pump configured in the mobile app.
+- If the log says **Terms of Service acceptance required** (`/terms-of-service/0`),
+  sign in to the **official PolyConnect mobile app** with the same credentials and
+  accept the terms. Acceptance in the MyTech Connect app does not apply to the
+  PolyConnect application endpoint. Restart the bridge afterwards.
 - Try **Reset Auth & IDs** to restart the discovery flow from scratch.
 
 **Bridge stuck / status not updating**

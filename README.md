@@ -40,7 +40,7 @@
 
 - Home Assistant OS or Supervised (required for the bridge add-on)
 - A Polytropic heat pump paired to the Polyconnect mobile app
-- Phone on the same WiFi as Home Assistant (one-time setup only)
+- Your Polyconnect email and password
 
 ---
 
@@ -58,15 +58,13 @@ Or manually: **HACS → ⋮ → Custom Repositories** → add `https://github.co
 
 Find **Polyconnect Bridge**, install it, and start it.
 
-### 3. Capture credentials
+### 3. Configure credentials
 
-Open the bridge panel from the HA sidebar:
+Open the bridge panel from the HA sidebar and enter the **Polyconnect email
+and password** used by the mobile app. The bridge logs in, registers a
+terminal and discovers your installation and heat pumps automatically.
 
-1. Click **Start Capture**
-2. On your phone, open the URL shown (e.g. `http://your-ha-ip:8080`)
-3. Follow the wizard to configure the proxy
-4. Open the Polyconnect app — credentials are captured automatically
-5. Done when status shows **Ready**
+No phone proxy or capture wizard is required.
 
 ### 4. Add the integration
 
@@ -78,11 +76,21 @@ The bridge URL is auto-detected. All entities appear immediately.
 
 ## Token Refresh
 
-Tokens expire periodically. When this happens, a **Repair issue** appears in HA.
+The bridge renews short-lived sessions automatically. If a **Repair issue**
+appears in HA, open the bridge panel and click **Refresh Browser** (or restart
+the add-on). If that fails, check the Polyconnect email/password in the add-on
+options. The integration reconnects automatically after a successful refresh.
 
-Fix: open the bridge panel → **Reset Credentials** → **Start Capture** → redo the phone step.
+---
 
-The integration recovers automatically once new credentials are captured.
+## Troubleshooting
+
+### Terms of Service acceptance required
+
+If the bridge reports **Terms of Service acceptance required**, sign in to
+the **official PolyConnect mobile app** with the same credentials and accept the
+terms there. Acceptance in the MyTech Connect app does not apply to the
+PolyConnect application endpoint. Then restart the bridge.
 
 ---
 
@@ -118,7 +126,7 @@ Commands take 4–8 seconds due to Blazor page transitions. The UI updates optim
 
 ## Limitations
 
-- **Token expiry** — requires periodic recapture via the bridge panel
+- **Session expiry** — sessions last ~12h and are refreshed automatically; if a refresh fails, open the bridge panel to renew it
 - **Command latency** — 4–8s per action (browser navigation)
 - **DOM fragility** — app UI changes may break scraping until selectors are updated
 - **Polling only** — no real-time push (MQTT is firewalled)
