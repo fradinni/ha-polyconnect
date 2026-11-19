@@ -1,8 +1,12 @@
 FROM python:3.12-slim-bookworm
 
-# Install system dependencies for Playwright/Chromium
+# Install system dependencies for Playwright/Chromium.
+# libatomic1 is required by Playwright's bundled Node driver before
+# `playwright install --with-deps` can run (the CLI itself fails to start
+# without libatomic.so.1).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
