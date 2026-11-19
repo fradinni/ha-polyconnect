@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.4.0
+
+- Version aligned with the integration 2.4.0 release. No bridge code changes
+  in this release; it includes the Polyconnect v9 compatibility fixes from
+  2.3.1 (new login URL, legacy-session recovery, `ÉCO` mode labels and
+  setpoint gauge direction).
+
 ## 2.3.1
 
 - **Polyconnect v9 login URL.** Declare application version `9.0` and load the

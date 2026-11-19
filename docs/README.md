@@ -71,7 +71,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 | `Dockerfile` | Debian + Chromium + Python |
 | `run.sh` | Startup script |
 
-**Version:** 2.3.1 · **Ports:** 8765 (API/ingress)
+**Version:** 2.4.0 · **Ports:** 8765 (API/ingress)
 
 ---
 
