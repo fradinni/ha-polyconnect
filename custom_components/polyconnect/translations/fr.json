@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connexion à Polyconnect",
-        "description": "Saisissez l'URL du serveur bridge Polyconnect.\n\n**Recommandé :** installez le module complémentaire **Polyconnect Bridge** depuis ce dépôt, puis utilisez son URL ingress (détectée automatiquement ci-dessous).\n\nVérifiez que vous avez effectué la **capture des identifiants** depuis l'interface du module complémentaire avant de terminer la configuration.",
+        "description": "Saisissez l'URL du serveur bridge Polyconnect.\n\n**Recommandé :** installez le module complémentaire **Polyconnect Bridge** depuis ce dépôt, puis utilisez son URL ingress (détectée automatiquement ci-dessous).\n\nVérifiez que le module complémentaire est configuré avec votre e-mail et votre mot de passe Polyconnect et affiche une session active.",
         "data": {
           "bridge_url": "URL du serveur bridge",
           "scan_interval": "Intervalle d'actualisation (minutes)"
@@ -16,7 +16,7 @@
     },
     "error": {
       "cannot_connect": "Impossible de se connecter au serveur bridge. Vérifiez que le module complémentaire Polyconnect Bridge fonctionne et que l'URL est correcte.",
-      "credentials_missing": "Le bridge fonctionne, mais les identifiants n'ont pas encore été capturés. Ouvrez l'interface du module complémentaire Polyconnect Bridge et lancez d'abord l'assistant de capture.",
+      "credentials_missing": "Le bridge fonctionne, mais n'est pas encore authentifié. Ouvrez le module complémentaire Polyconnect Bridge et saisissez votre e-mail et votre mot de passe Polyconnect.",
       "unknown": "Erreur inattendue. Consultez les journaux de Home Assistant pour plus de détails."
     },
     "abort": {
@@ -40,11 +40,11 @@
   "issues": {
     "auth_expired": {
       "title": "Jeton Polyconnect expiré",
-      "description": "Le jeton de session de votre pompe à chaleur Polyconnect a expiré. Ouvrez le module complémentaire **Polyconnect Bridge** et cliquez sur **Démarrer la capture** pour obtenir un nouveau jeton.\n\nAprès une nouvelle capture, l'intégration se reconnectera automatiquement."
+      "description": "La session de votre pompe à chaleur Polyconnect a expiré. Ouvrez le module complémentaire **Polyconnect Bridge** et cliquez sur **Refresh Browser** (ou redémarrez le module) pour renouveler la session.\n\nAprès un rafraîchissement réussi, l'intégration se reconnectera automatiquement."
     },
     "credentials_missing": {
       "title": "Identifiants Polyconnect non configurés",
-      "description": "Le module complémentaire Polyconnect Bridge fonctionne, mais aucun identifiant n'a été capturé. Ouvrez son interface et suivez l'assistant de capture pour configurer la connexion à votre pompe à chaleur."
+      "description": "Le module complémentaire Polyconnect Bridge fonctionne, mais aucun identifiant n'est configuré. Ouvrez son interface et saisissez votre e-mail et votre mot de passe Polyconnect."
     }
   }
 }

@@ -19,7 +19,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 │   │  • Climate entity   │        │  • Headless Chromium         │  │
 │   │  • 6 Sensors        │        │  • DOM scraping (status)     │  │
 │   │  • 4 Binary sensors │        │  • Simulated clicks (cmds)   │  │
-│   │  • 1 Switch         │        │  • Credential capture (MITM) │  │
+│   │  • 1 Switch         │        │  • Native login + refresh    │  │
 │   └─────────────────────┘        └───────────────┬──────────────┘  │
 │                                                   │                 │
 └───────────────────────────────────────────────────┼─────────────────┘
@@ -28,7 +28,8 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
                                           │  Polyconnect Cloud     │
                                           │  (Blazor SignalR)      │
                                           │  polytropic.user-app.  │
-                                          │  pool.mytech-connect.io│
+                                          │  v2.pool.mytech-       │
+                                          │  connect.io            │
                                           └────────────────────────┘
 ```
 
@@ -36,7 +37,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 
 1. **Polling** (every 60s by default): Integration → `GET /status` → Bridge scrapes the Blazor DOM → returns JSON with all sensor data.
 2. **Commands** (setpoint, mode, on/off): Integration → `POST /setpoint` etc. → Bridge navigates to the Blazor edit page, clicks the right buttons, confirms, then navigates back.
-3. **Credential capture**: First-time setup where the user's phone traffic is proxied through mitmproxy to extract the session token and device IDs.
+3. **Authentication**: The bridge logs in with the Polyconnect email/password against `auth.pool.mytech-connect.io`, registers a terminal, and persists a short-lived session token in `/data/session.json`. Sessions are refreshed automatically.
 
 ---
 
@@ -64,9 +65,7 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 | File | Purpose |
 |------|---------|
 | `server.py` | Flask REST API + Playwright controller + ingress panel |
-| `capture_manager.py` | Credential capture lifecycle (mitmproxy orchestration) |
-| `setup_ui.py` | Phone-facing setup wizard served on port 8080 during capture |
-| `mitm_addon.py` | mitmproxy addon that intercepts and extracts the session token |
+| `auth.py` | Native login, terminal registration, session refresh |
 | `config.yaml` | Add-on manifest (ports, schema, ingress) |
 | `Dockerfile` | Debian + Chromium + Python |
 | `run.sh` | Startup script |
@@ -124,21 +123,19 @@ The Polyconnect cloud platform has **no public REST API**. All device interactio
 
 1. A working Polyconnect heat pump connected to the Polyconnect app
 2. Home Assistant OS or Supervised (required for the add-on)
-3. Phone on the same WiFi as HA (for credential capture)
+3. Your Polyconnect email and password
 
 ### Steps
 
 1. **Install the Bridge add-on** (via the local add-on repository)
 2. **Start the add-on** — it exposes an ingress panel in the HA sidebar
-3. **Capture credentials:**
+3. **Configure credentials:**
    - Open the add-on panel in HA
-   - Click "Start Capture"
-   - On your phone, connect to the proxy shown (http://your-ha-ip:8080)
-   - Follow the wizard — open the Polyconnect app while proxied
-   - The bridge intercepts the session token and device IDs
+   - Enter the Polyconnect email and password used by the mobile app
+   - Wait for the bridge to show **Ready** and list the discovered heat pumps
 4. **Add the integration** — go to Settings → Integrations → Add → "Polyconnect"
    - The bridge URL is auto-detected if running on the same machine
-   - Config flow validates that the bridge is reachable and credentials are captured
+   - Config flow validates that the bridge is reachable and authenticated
 5. **Done** — entities appear under a "Polyconnect Heat Pump" device
 
 ### Options
@@ -167,10 +164,10 @@ The config flow (`config_flow.py`) performs these checks:
 | Error | Meaning |
 |-------|---------|
 | `cannot_connect` | Bridge add-on not running or unreachable |
-| `credentials_missing` | Bridge running but no credentials captured yet |
-| `auth_expired` | Session token expired — recapture needed |
+| `credentials_missing` | Bridge running but not authenticated yet |
+| `auth_expired` | Session expired and the bridge could not refresh it |
 
-When auth expires at runtime, the coordinator creates a **repair issue** (visible in Settings → Repairs) prompting the user to recapture credentials.
+When auth expires at runtime, the coordinator creates a **repair issue** (visible in Settings → Repairs) prompting the user to renew the bridge session. If the bridge reports `tos_required`, accept the Terms of Service in the official PolyConnect mobile app and restart the add-on.
 
 ---
 

@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect to Polyconnect",
-        "description": "Enter the URL of the Polyconnect bridge server.\n\n**Recommended:** Install the **Polyconnect Bridge** add-on from this repository, then use its ingress URL (auto-detected below).\n\nMake sure you have run the **credential capture** from the add-on's UI before completing setup.",
+        "description": "Enter the URL of the Polyconnect bridge server.\n\n**Recommended:** Install the **Polyconnect Bridge** add-on from this repository, then use its ingress URL (auto-detected below).\n\nMake sure the add-on is configured with your Polyconnect email and password and shows an active session.",
         "data": {
           "bridge_url": "Bridge Server URL",
           "scan_interval": "Scan Interval (minutes)"
@@ -16,7 +16,7 @@
     },
     "error": {
       "cannot_connect": "Cannot connect to the bridge server. Make sure the Polyconnect Bridge add-on is running and the URL is correct.",
-      "credentials_missing": "The bridge is running but credentials have not been captured yet. Open the Polyconnect Bridge add-on UI and run the capture wizard first.",
+      "credentials_missing": "The bridge is running but is not authenticated yet. Open the Polyconnect Bridge add-on and enter your Polyconnect email and password.",
       "unknown": "Unexpected error. Check the Home Assistant logs for details."
     },
     "abort": {
@@ -40,11 +40,11 @@
   "issues": {
     "auth_expired": {
       "title": "Polyconnect token expired",
-      "description": "The session token for your Polyconnect heat pump has expired. Open the **Polyconnect Bridge** add-on and click **Start Capture** to get a new token.\n\nAfter recapturing, the integration will reconnect automatically."
+      "description": "The session for your Polyconnect heat pump has expired. Open the **Polyconnect Bridge** add-on and click **Refresh Browser** (or restart the add-on) to renew the session.\n\nAfter a successful refresh, the integration will reconnect automatically."
     },
     "credentials_missing": {
       "title": "Polyconnect credentials not configured",
-      "description": "The Polyconnect Bridge add-on is running but no credentials have been captured yet. Open the add-on UI and follow the capture wizard to set up your heat pump connection."
+      "description": "The Polyconnect Bridge add-on is running but has no credentials configured. Open the add-on and enter your Polyconnect email and password."
     }
   }
 }
