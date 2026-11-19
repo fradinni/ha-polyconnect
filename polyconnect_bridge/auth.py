@@ -211,7 +211,7 @@ def _login_remote(email: str, password: str, terminal_id: str, terminal_key: str
         "e": email.strip().lower(),
         "h": pwd_hash,
         "tid": terminal_id,
-        "av": "5.3",
+        "av": "9.0",
         "pn": "com.polytropic.pool",
     }
     envelope = _make_terminal_signed({"args": args}, terminal_id, terminal_key)
