@@ -91,7 +91,10 @@ The integration recovers automatically once new credentials are captured.
 | Setting                 | Default | Options  | Description                                    |
 | ----------------------- | ------- | -------- | ---------------------------------------------- |
 | Scan interval           | 1 min   | 1–60 min | How often to poll the bridge for status        |
-| Operating mode language | French  | FR / EN  | Language used for operating-mode sensor values |
+| Operating mode language | French¹ | FR / EN  | Language used for operating-mode sensor values |
+
+¹ Existing installations default to French. New installations start in the
+Home Assistant UI language when it is French or English, otherwise French.
 
 Configure in **Settings → Devices & Services → Polyconnect → Configure**.
 

@@ -35,6 +35,20 @@ class LanguageTests(unittest.TestCase):
             const.LANGUAGE_FRENCH,
         )
 
+    def test_new_install_language_follows_home_assistant(self) -> None:
+        expected = {
+            "en": const.LANGUAGE_ENGLISH,
+            "en-GB": const.LANGUAGE_ENGLISH,
+            "EN_us": const.LANGUAGE_ENGLISH,
+            "fr": const.LANGUAGE_FRENCH,
+            "fr-CA": const.LANGUAGE_FRENCH,
+            "de": const.LANGUAGE_FRENCH,
+            None: const.LANGUAGE_FRENCH,
+        }
+        for ha_language, language in expected.items():
+            with self.subTest(ha_language=ha_language):
+                self.assertEqual(const.resolve_language(ha_language), language)
+
     def test_english_operating_modes_are_translated(self) -> None:
         expected = {
             "Chauffage": "Heating",

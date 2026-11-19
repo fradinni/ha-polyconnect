@@ -18,6 +18,7 @@ from .const import (
     LANGUAGE_OPTIONS,
     LOGGER,
     get_language,
+    resolve_language,
 )
 
 ADDON_SLUG_SUFFIX = "polyconnect_bridge"
@@ -111,7 +112,12 @@ class PolyconnectConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(
                     title="Polyconnect Heat Pump",
                     data={CONF_BRIDGE_URL: url},
-                    options={CONF_SCAN_INTERVAL: int(user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))},
+                    options={
+                        CONF_SCAN_INTERVAL: int(user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)),
+                        # New entries follow the HA UI language; existing entries
+                        # without this option keep the French default.
+                        CONF_LANGUAGE: resolve_language(self.hass.config.language),
+                    },
                 )
 
         return self.async_show_form(

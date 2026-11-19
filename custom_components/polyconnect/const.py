@@ -31,6 +31,12 @@ def get_language(options: Mapping[str, object]) -> str:
     return DEFAULT_LANGUAGE
 
 
+def resolve_language(value: str | None) -> str:
+    """Map a Home Assistant language code to a supported display language."""
+    code = (value or "").replace("_", "-").split("-", 1)[0].lower()
+    return code if code in LANGUAGE_OPTIONS else DEFAULT_LANGUAGE
+
+
 OPERATING_MODE_TRANSLATIONS: dict[str, dict[str, str]] = {
     LANGUAGE_ENGLISH: {
         "Chauffage": "Heating",
