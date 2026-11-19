@@ -101,6 +101,26 @@ _PRECONDITION_REASONS = {"pump_off"}
 # 24-char MongoDB ObjectId in Blazor SPA URLs (/installation-overview/<id>, /heat-pump-view/<id>)
 _OBJECTID_RE = re.compile(r"/([0-9a-f]{24})(?:/|$|\?)")
 
+# The SPA redirects accounts that have not accepted the Polyconnect
+# application Terms of Service to /terms-of-service/<id>. The bridge uses the
+# PolyConnect app identity, so acceptance in the MyTech Connect app does not
+# count.
+TOS_MESSAGE = (
+    "Polyconnect Terms of Service acceptance required. Open the official "
+    "PolyConnect mobile app with the same email and password, accept the "
+    "Terms of Service, then restart the bridge."
+)
+
+
+class TermsOfServiceRequired(RuntimeError):
+    """The Polyconnect SPA is waiting for Terms of Service acceptance."""
+
+
+def _is_tos_url(url: str | None) -> bool:
+    """True when the SPA is on the Terms of Service route."""
+    return urlsplit(url or "").path.startswith("/terms-of-service")
+
+
 # Power toggle. The real control is
 # <button id="heat-pump-on-off" class="... co-on-off-button">; the class
 # selectors are kept behind it as fallbacks for other UI variants. The id must
@@ -403,10 +423,23 @@ class PolyconnectController:
         # Which pump's /heat-pump-view/<id> the single Chromium page is currently on.
         # Smart-navigation only navigateTo's when the active pump differs.
         self._current_pump_id: str | None = None
+        # Last controller error and whether it is the ToS interstitial.
+        self._last_error: str | None = None
+        self._tos_required = False
         # Staleness detection state, per-pump.
         self._last_data: dict[str, dict] = {}
         self._last_change_ts: dict[str, float] = {}
         self._unchanged_count: dict[str, int] = {}
+
+    @property
+    def last_error(self) -> str | None:
+        """Last browser/discovery error, surfaced by /health and the UI."""
+        return self._last_error
+
+    @property
+    def tos_required(self) -> bool:
+        """True when discovery is blocked by pending Terms of Service."""
+        return self._tos_required
 
     def _launch(self):
         from playwright.sync_api import sync_playwright
@@ -430,7 +463,9 @@ class PolyconnectController:
         self._page    = self._ctx.new_page()
         try:
             self._load_app()
-        except Exception:
+        except Exception as e:
+            self._last_error = str(e)
+            self._tos_required = isinstance(e, TermsOfServiceRequired)
             # Clean up so _ensure() forces a fresh relaunch next call
             try:
                 self._browser.close()
@@ -464,6 +499,8 @@ class PolyconnectController:
             BASE = f"{parsed.scheme}://{parsed.netloc}"
             log.info("Loading Polyconnect application from %s", BASE)
             page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
+            if _is_tos_url(page.url):
+                raise TermsOfServiceRequired(TOS_MESSAGE)
             try:
                 page.wait_for_function(
                     "() => typeof Blazor !== 'undefined' && Blazor._internal",
@@ -476,6 +513,8 @@ class PolyconnectController:
                     timeout=8_000)
             except Exception:
                 pass
+            if _is_tos_url(page.url):
+                raise TermsOfServiceRequired(TOS_MESSAGE)
             body = page.evaluate("() => document.body.innerText.substring(0, 200)")
             lowered = body.lower()
             rejected = ("403" in body or "must be connected" in lowered
@@ -515,6 +554,8 @@ class PolyconnectController:
         default_pump = pumps[0]["id"]
         self._current_pump_id = None  # force navigation
         self._navigate_to_pump(default_pump)
+        if _is_tos_url(page.url):
+            raise TermsOfServiceRequired(TOS_MESSAGE)
         body = page.evaluate("() => document.body.innerText.substring(0, 200)")
         if "403" in body or "must be connected" in body.lower():
             log.warning("Session token expired post-load — refreshing …")
@@ -522,6 +563,8 @@ class PolyconnectController:
             if not res.get("ok"):
                 raise RuntimeError(f"Session token expired and refresh failed: {res.get('error')}")
             raise RuntimeError("Session token expired — refreshed, will retry")
+        self._last_error = None
+        self._tos_required = False
         log.info("Browser launched, default pump view loaded (%d pump(s) total)", len(pumps))
 
     def _navigate_to_pump(self, pump_id: str) -> None:
@@ -629,14 +672,19 @@ class PolyconnectController:
         page = self._page
         log.info("Discovering installation + heat-pump IDs from SPA …")
 
-        # Wait for the SPA's default route (installation-overview or direct heat-pump-view).
+        # Wait for the SPA's default route (installation-overview, direct
+        # heat-pump-view, or the ToS interstitial).
         try:
             page.wait_for_function(
                 "() => /\\/installation-overview\\/[0-9a-f]{24}/.test(window.location.pathname)"
-                " || /\\/heat-pump-view\\/[0-9a-f]{24}/.test(window.location.pathname)",
+                " || /\\/heat-pump-view\\/[0-9a-f]{24}/.test(window.location.pathname)"
+                " || window.location.pathname.includes('/terms-of-service/')",
                 timeout=15_000)
         except Exception:
             log.warning("SPA did not auto-route to a known view (url=%s)", page.url)
+
+        if _is_tos_url(page.url):
+            raise TermsOfServiceRequired(TOS_MESSAGE)
 
         installation_id: str | None = None
         m = _OBJECTID_RE.search(page.url or "")
@@ -755,6 +803,8 @@ class PolyconnectController:
     def _ensure_view(self, pump_id: str) -> None:
         """Ensure the page is on /heat-pump-view/<pump_id>.
         Detects expired sessions and refreshes; smart-navigates between pumps."""
+        if _is_tos_url(self._page.url):
+            raise TermsOfServiceRequired(TOS_MESSAGE)
         try:
             snippet = self._page.evaluate(
                 "() => document.body.innerText.substring(0, 120)")
@@ -1430,6 +1480,9 @@ def _error_payload(e: Exception) -> tuple[dict, int] | None:
     so callers can decide between retrying and reporting a generic 500.
     """
     msg = str(e).lower()
+    if isinstance(e, TermsOfServiceRequired):
+        return {"error": TOS_MESSAGE, "reason": "terms_of_service_required",
+                "tos_required": True}, 409
     if "expired" in msg or "refreshed" in msg or "recapture" in msg:
         return {"error": str(e), "auth_expired": True}, 401
     if "unknown pump_id" in msg:
@@ -1574,7 +1627,8 @@ def health():
         "email_configured": auth_status["email_configured"],
         "terminal_registered": auth_status["terminal_registered"],
         "session_age_seconds": auth_status["session_age_seconds"],
-        "last_error": auth_status["last_error"],
+        "last_error": ctrl.last_error or auth_status["last_error"],
+        "tos_required": ctrl.tos_required,
     })
 
 
@@ -1982,7 +2036,7 @@ def _build_ingress_html() -> str:
     creds = _auth_mgr.credentials
     st = _auth_mgr.get_status()
     session_age = st.get("session_age_seconds")
-    last_err = st.get("last_error") or ""
+    last_err = ctrl.last_error or st.get("last_error") or ""
 
     def _fmt_age(secs: int | None) -> str:
         if secs is None:
@@ -2020,8 +2074,10 @@ def _build_ingress_html() -> str:
         for p in creds.heat_pumps
     ) or '<div class="empty">No heat pumps discovered yet.</div>'
 
-    overall_ok = creds.is_complete
+    overall_ok = creds.is_complete and not ctrl.tos_required
     overall_txt = "Ready" if overall_ok else "Incomplete"
+    overall_detail = ("Terms of Service acceptance required" if ctrl.tos_required
+                      else "All systems go" if overall_ok else "Awaiting login")
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -2222,7 +2278,7 @@ body {{
         <h2><span class="dot"></span>Bridge</h2>
         <div class="stat">
           <span id="bridge-pill" class="pill {'ok' if overall_ok else 'warn'}">{overall_txt.upper()}</span>
-          <span id="bridge-detail" class="big">{'All systems go' if overall_ok else 'Awaiting login'}</span>
+          <span id="bridge-detail" class="big">{overall_detail}</span>
         </div>
       </div>
 

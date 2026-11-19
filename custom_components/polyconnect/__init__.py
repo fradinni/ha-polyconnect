@@ -11,8 +11,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 
-from .coordinator import PolyconnectCoordinator
+from .api import PolyconnectError
 from .const import DOMAIN, PLATFORMS, LOGGER
+from .coordinator import PolyconnectCoordinator
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -28,6 +29,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(f"Cannot reach Polyconnect bridge: {err}") from err
 
     if not pumps:
+        # A pending ToS acceptance is not a transient discovery delay: surface
+        # the actionable message instead of retrying forever.
+        try:
+            health = await coordinator.api.get_health()
+        except PolyconnectError:
+            health = {}
+        if health.get("tos_required"):
+            raise ConfigEntryNotReady(
+                health.get("last_error")
+                or "Polyconnect Terms of Service acceptance required — open the "
+                   "official PolyConnect mobile app, accept the terms, then restart the bridge."
+            )
+
         # Could happen on a brand-new install where the bridge hasn't logged
         # in yet. Trigger a /status fetch which forces the bridge to launch
         # Playwright + discover pumps, then try again.
